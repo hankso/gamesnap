@@ -1,0 +1,84 @@
+[project]
+name = "GameSnap"
+version = "0.1.2"
+authors = [
+    { name = "Hankso", email = "hankso@gmail.com" }
+]
+license = { text = "MIT License" }
+description = "Backup and restore files by taking snapshots incrementally like git"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil",
+    "textual",
+    "keyboard",
+    "watchdog",
+    "ttkbootstrap",
+    "backports.zstd; python_version < '3.14'",
+]
+
+[dependency-groups]
+dev = [
+    "viztracer",
+    "textual-dev",
+]
+extra = [
+    "json_repair",
+    "rich-pixels",
+    "rich-argparse",
+]
+build = [
+    "nuitka",
+    "ImageIO",
+]
+
+[tool.poe]
+executor = { type = "uv", group = ["dev", "extra"] }
+
+[tool.poe.tasks]
+run = { cmd = "GSnap.py", help = "Entry point" }
+tui = { cmd = "textual run --dev GSnap:GameSnapTUI", help = "Debug with textual" }
+
+[tool.poe.tasks._mkdir]
+script = "os:makedirs('build', exist_ok=True)"
+
+[tool.poe.tasks.trace]
+help = "Debug with viztracer"
+sequence = [
+    "_mkdir",
+    { cmd = "viztracer --tracer_entries 100000000 -o build/trace.json.gz -- GSnap.py $POE_EXTRA_ARGS" }
+]
+
+[tool.poe.tasks.build]
+help = "Build all with nuitka"
+sequence = ["build-gui", "build-cui", "view-build"]
+
+[tool.poe.tasks.build-gui]
+help = "Build GUI with nuitka"
+cmd = "nuitka GSnap.py"
+executor = { exact = true, no-group = "dev", group = "build" }
+
+[tool.poe.tasks.build-cui]
+help = "Build CUI with nuitka"
+control.expr = "sys.platform"
+default = "pass"
+
+    [[tool.poe.tasks.build-cui.switch]]
+    case = "win32"
+    env = { SUBSYSTEM = "CUI" }
+    cmd = "nuitka GSnap.py"
+    executor = { exact = true, no-group = "dev", group = ["extra", "build"] }
+
+[tool.poe.tasks.view-trace]
+help = "View trace report"
+sequence = [
+    "_mkdir",
+    { cmd = "vizviewer build/trace.json.gz $POE_EXTRA_ARGS" }
+]
+
+[tool.poe.tasks.view-build]
+help = "View build report"
+sequence = [
+    "_mkdir",
+    { cmd = "uvx nuitka-reporter build/report.xml build/report.html" },
+    { script = "webbrowser:open('file://' + os.path.abspath('build/report.html'))" }
+]  # currently nuitka-reporter only render html so we have to manually open it
