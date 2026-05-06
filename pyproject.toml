@@ -1,6 +1,6 @@
 [project]
 name = "GameSnap"
-version = "0.1.2"
+version = "0.1.3"
 authors = [
     { name = "Hankso", email = "hankso@gmail.com" }
 ]
@@ -35,7 +35,7 @@ build = [
 executor = { type = "uv", group = ["dev", "extra"] }
 
 [tool.poe.tasks]
-run = { cmd = "GSnap.py", help = "Entry point" }
+run = { shell = "python GSnap.py $POE_EXTRA_ARGS", help = "Entry point" }
 tui = { cmd = "textual run --dev GSnap:GameSnapTUI", help = "Debug with textual" }
 
 [tool.poe.tasks._mkdir]
@@ -55,7 +55,7 @@ sequence = ["build-gui", "build-cui", "view-build"]
 [tool.poe.tasks.build-gui]
 help = "Build GUI with nuitka"
 cmd = "nuitka GSnap.py"
-executor = { exact = true, no-group = "dev", group = "build" }
+executor = { exact = true, no-group = "dev", group = ["extra", "build"] }
 
 [tool.poe.tasks.build-cui]
 help = "Build CUI with nuitka"
@@ -80,5 +80,5 @@ help = "View build report"
 sequence = [
     "_mkdir",
     { cmd = "uvx nuitka-reporter build/report.xml build/report.html" },
-    { script = "webbrowser:open('file://' + os.path.abspath('build/report.html'))" }
+    { script = "GSnap:browse('build/report.html', True)" }
 ]  # currently nuitka-reporter only render html so we have to manually open it
