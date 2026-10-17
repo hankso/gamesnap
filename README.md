@@ -1,5 +1,7 @@
 # GameSnap
 
+[![Build & Release](https://github.com/hankso/gamesnap/actions/workflows/ci.yml/badge.svg)](https://github.com/hankso/gamesnap/actions/workflows/ci.yml)
+
 > 像 Git 一样为游戏存档创建**增量快照**，随时备份、恢复、导出。
 
 GameSnap 是一个单文件 Python 应用（`GSnap.py`），用于游戏存档的自动化备份。
@@ -36,7 +38,7 @@ GameSnap 是一个单文件 Python 应用（`GSnap.py`），用于游戏存档�
 
 从 [Releases](https://github.com/hankso/gamesnap/releases/latest) 下载对应平台的单文件可执行程序：
 
-`GameSnap[GUI]-[windows|linux|macos]-[x86_64|arm64][.exe]`
+`GameSnap[GUI]-[windows|linux|macos]-[amd64|arm64][.exe]`
 
 > `GameSnapGUI` 是 Windows GUI Subsystem 程序，双击运行时默认不显示终端，此外与 `GameSnap` 功能完全一致
 
@@ -60,42 +62,41 @@ python GSnap.py --help
 ## 快速开始
 
 ```bash
-# 1. 手动创建快照（打印文件信息）
-GameSnap create -v
-
-# 2. 查看所有快照（打印文件大小）
-GameSnap summary --size
-
-# 3. 恢复指定快照（默认恢复到记录中的原始目录，并同步删除多余文件）
-GameSnap restore /path/to/20260401-001644-123456.zstd
-
-# 4. 导出分享快照（并行 deflated zip 压缩）
-GameSnap export /path/to/20260401-001644-123456.zstd ./share.zip
-
-# 5. 删除指定快照（自动清理多余的 blob 文件）
-GameSnap delete /path/to/20260401-001644-123456.zstd
-
-# 6. 启动桌面或终端界面
+# 1. 启动桌面或终端界面
 GameSnap gui
 GameSnap tui
 
-# 7. 守护进程
+# 2. 无界面后台运行
 GameSnap daemon --pid --log ./log.txt
 
+# 3. 手动创建快照（打印文件信息）
+GameSnap create -v
+
+# 4. 查看所有快照（打印文件大小）
+GameSnap summary --size
+
+# 5. 恢复指定快照（默认恢复到记录中的原始目录，并同步删除多余文件）
+GameSnap restore /path/to/20260401-001644-123456.zstd
+
+# 6. 导出分享快照（并行 deflated zip 压缩）
+GameSnap export /path/to/20260401-001644-123456.zstd ./share.zip
+
+# 7. 删除指定快照（自动清理多余的 blob 文件）
+GameSnap delete /path/to/20260401-001644-123456.zstd
+
 # 8. 指定配置文件启动（默认程序同目录 `config.json`）
-GameSnap gui --config /path/to/custom.json
+GameSnap <command> --config /path/to/custom.json
 
 # 9. 导入 EZAB 预设
-GameSnap tui --preset /path/to/GAMELIST.ERAB <GAME>
+GameSnap <command> --preset /path/to/GAMELIST.ERAB <GAME>
 
-# 10. 覆盖参数（不修改配置文件）
-GameSnap create \
-    --param compress_STORAGE=true \ # 参数名忽略大小写
-    --param watchdog_enabled \      # 启用文件监控，可省略 `=true`
-    --param incs="*.bin;*.dat"      # 支持别名简写
+# 10. 手动覆盖参数
+GameSnap <command>                  \
+    --param compress_STORAGE=true   \ # 参数名忽略大小写
+    --param watchdog_enabled        \ # bool 类型参数可省略 `=true`
+    --param incs="*.bin;*.dat"      \ # 支持别名简写
+    --param bdir="C:\path/to\bdir"    # 兼容 slash 和 backslash
 ```
-
-### 全局选项
 
 | 选项 | 说明 |
 |---|---|
@@ -104,25 +105,23 @@ GameSnap create \
 | `-s, --serial` | 禁用并发，单线程处理文件 |
 | `--config PATH` | 指定配置文件 |
 | `--preset FILE GAME` | 从 EZAB 预设文件加载指定游戏的存档目录与进程名 |
-| `--param KEY[=VAL] ...` | 手动指定参数 |
-
----
-
-## 命令参考
+| `--param KEY[=VAL] ...` | 手动覆盖参数 |
 
 | 命令 | 说明 |
 |---|---|
+| `gui` | 图形用户界面（默认命令） |
+| `tui [--css PATH...]` | 终端用户界面（textual） |
+| `daemon [--log PATH] [--pid PATH]` | 无界面后台运行，配合配置文件中的定时/监控/热键任务 |
 | `create` | 手动创建一次快照 |
 | `restore RECORD [MEMBER...] [--sdir DIR]` | 恢复快照；`MEMBER` 可按相对路径过滤部分文件 |
 | `export RECORD OUTPUT` | 将快照打包为 zip（内含原始目录结构 + 截图） |
 | `delete (PATH... \| --latest N \| --oldest N \| --all)` | 删除快照并自动清理不再被引用的 blob |
 | `summary [--size]` | 列出备份目录下所有快照（`--size` 显示体积与压缩比） |
-| `runtest` | 运行自检，验证引擎全部流程并报告错误 |
 | `modman [ID...] [--mdir DIR] [--copy DIR] [--sync] [--gid ID] [--yes]` | Steam 创意工坊模组管理（详见下文） |
 | `update (--url URL \| --repo USER REPO \| --ppid PID \| --gen DIR)` | 检查下载新版本 / 生成版本信息 |
-| `daemon [--log PATH] [--pid PATH]` | 无界面后台运行，配合配置文件中的定时/监控/热键任务 |
-| `tui [--css PATH...]` | 终端用户界面（textual） |
-| `gui` | 图形用户界面（默认命令） |
+| `test` | 运行自检，验证引擎全部流程并报告错误 |
+
+> 子命令用法详见 `GameSnap <command> -h`
 
 ### Steam 创意工坊（modman）
 
@@ -136,7 +135,7 @@ GameSnap modman --yes 3171167894 [--gid 108600]  # 未找到 SteamCMD 时自动�
 # 更新 MDIR 下所有已下载模组
 GameSnap modman --sync
 
-# 将下载的模组复制到游戏目录
+# 将 $MDIR/steamapps/workshop/content/*/mods/* 同步到指定目录
 GameSnap modman --copy "D:/Games/mods/"
 ```
 
@@ -150,7 +149,7 @@ GameSnap update --repo hankso gamesnap
 GameSnap update --url https://example.com/gamesnap/
 
 # 生成版本信息文件（发布流程用）
-GameSnap update --gen dist/ --match '{name}-{plat}-{arch}{ext}'
+GameSnap update --gen ./dist/
 ```
 
 ---
@@ -254,12 +253,13 @@ fetch('http://localhost:9999/apis', {
 uv sync --all-groups
 
 # 通过 poe 运行任务（pyproject.toml 中定义）
-uv run poe main        # 入口 GSnap:main
-uv run poe runtest     # 运行自检
-uv run poe trace       # viztracer 性能追踪 → build/trace.json.gz
-uv run poe view-trace  # 可视化追踪结果
+uv run poe run         # 入口 GSnap:main
 uv run poe textual     # textual-dev 热重载调试 TUI
 uv run poe console     # textual 日志控制台
+uv run poe trace       # viztracer 性能追踪 → build/trace.json.gz
+uv run poe view-trace  # 可视化追踪结果
+uv run poe build       # nuitka 打包 onefile
+uv run poe view-build  # 渲染并查看 nuitka 编译 report.html
 ```
 
 ### 打包（Nuitka）
@@ -267,17 +267,18 @@ uv run poe console     # textual 日志控制台
 源码内嵌 `nuitka-project:` 指令，直接 `nuitka GSnap.py` 即可
 
 ```bash
-# Windows 下载 upx: https://github.com/upx/upx/releases
-# Linux 依赖工具链 apt/dnf/yum install gcc upx ccache patchelf
+# Windows: choco install upx
+# Linux: apt install gcc upx ccache patchelf python3-tk (or up-ucl)
 
-nuitka GSnap.py                  # 单文件可执行（含 tk-inter 插件、图标、UPX）
+nuitka GSnap.py                           # 默认生成 onefile 或 app (macOS)
 
 # Windows 切换子系统
-set SUBSYSTEM=CUI && nuitka GSnap.py    # → GameSnapCUI.exe（控制台版）
-$env:SUBSYSTEM = "GUI"; & nuitka GSnap.py   # → GameSnapGUI.exe（无控制台）
+set SUBSYSTEM=CUI && nuitka GSnap.py      # → GameSnap.exe
+$env:SUBSYSTEM = "GUI"; & nuitka GSnap.py # → GameSnapGUI.exe（无控制台）
 
 # 或使用 poe（自动处理环境变量与依赖组）
-uv run poe build-all
+uv run poe build
+uv run poe build-gui
 ```
 
 ### 兼容性说明

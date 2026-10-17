@@ -13,16 +13,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: windows-latest
-            plat: windows
-            arch: amd64
-          - os: ubuntu-latest
-            plat: linux
-            arch: amd64
-          - os: macos-latest
-            plat: macos
-            arch: arm64
+        os: [windows-latest, ubuntu-latest, macos-latest]
 
     runs-on: ${{ matrix.os }}
 
@@ -41,11 +32,43 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
         with:
-          arch: ${{ matrix.arch }}
+          arch: amd64
 
       - name: Install dependencies (Windows)
         if: runner.os == 'Windows'
-        run: choco install upx -y
+        id: install-upx
+        shell: bash
+        run: |
+          set -euo pipefail
+          if choco install -y upx 2>/dev/null; then
+            hash -r
+            if command -v upx >/dev/null 2>&1 && upx --version >/dev/null 2>&1; then
+              UPX_EXE="$(command -v upx)"
+              UPX_DIR="$(cygpath -w "$(dirname "${UPX_EXE}")")"
+              echo "UPX installed via choco: ${UPX_EXE}"
+              echo "${UPX_DIR}" >> "${GITHUB_PATH}"
+              echo "dir=${UPX_DIR}" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+          echo "Choco install failed, falling back to curl"
+          UPX_VER="5.2.1"
+          UPX_PATH="upx-${UPX_VER}-win64"
+          ZIP_NAME="${UPX_PATH}.zip"
+          ZIP_PATH="${RUNNER_TEMP}/${ZIP_NAME}"
+          UPX_EXE="${RUNNER_TEMP}/${UPX_PATH}/upx.exe"
+          URL="https://github.com/upx/upx/releases/download/v${UPX_VER}/${ZIP_NAME}"
+          curl -sSlo "${ZIP_PATH}" "${URL}"
+          unzip -q "${ZIP_PATH}" -d "$(dirname "${ZIP_PATH}")"
+          if "${UPX_EXE}" --version >/dev/null 2>&1; then
+            UPX_DIR="$(cygpath -w "$(dirname "${UPX_EXE}")")"
+            echo "UPX installed from github: ${UPX_EXE}"
+            echo "${UPX_DIR}" >> "${GITHUB_PATH}"
+            echo "dir=${UPX_DIR}" >> "${GITHUB_OUTPUT}"
+          else
+            echo "::error::Download UPX from choco and github failed"
+            exit 1
+          fi
 
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
@@ -53,45 +76,43 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y upx-ucl patchelf python3-tk
 
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: brew install upx
-
+      # TODO: remove this step if cache hit is 0%
+      # uv cache path uses a random folder name that changes every run
+      # so the <#include> that nuitka passes to ccache might also change
       - name: Setup ccache (Linux/macOS)
         if: runner.os != 'Windows'
         uses: hendrikmuhs/ccache-action@v1.2
         with:
           key: ${{ github.job }}-${{ matrix.os }}
 
-      - name: Build all
-        env:
-          NUITKA_ASSUME_YES_FOR_DOWNLOADS: "1"
-        run: uv tool run --from poethepoet poe build-all
+      - name: Build & pack & test
+        run: uv tool run --from poethepoet poe dist --assume-yes-for-downloads
 
-      - name: Rename artifact
+      - name: Build report
+        continue-on-error: true
         shell: bash
-        env:
-          VERSION: ${{ github.ref_name }}
-          TARGET: ${{ matrix.plat }}-${{ matrix.arch }}
         run: |
-          mkdir -p upload
-          suffix="-${VERSION#v}-${TARGET}"
-          if [ -f "build/GameSnap" ]; then
-            mv build/GameSnap upload/GameSnap-${suffix}
-          fi
-          if [ -f "build/GameSnapCUI.exe" ]; then
-            mv build/GameSnapCUI.exe upload/GameSnap-${suffix}.exe
-          fi
-          if [ -f "build/GameSnapGUI.exe" ]; then
-            mv build/GameSnapGUI.exe upload/GameSnapGUI-${suffix}.exe
-          fi
+          uv tool install git+https://github.com/Bingdom/Nuitka-Compile-Report-Parser
+          for name in report report-gui; do
+            xml="build/${name}.xml"
+            [[ -f "$xml" ]] || continue
+            uv tool run nuitka-reporter "$xml" "build/${name}-${{ matrix.os }}.html"
+          done
 
-      - name: Upload artifact
+      - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.os }}
-          path: upload/*
+          name: release-${{ matrix.os }}
+          path: dist/*
           retention-days: 7
+
+      - name: Upload build reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: report-${{ matrix.os }}
+          path: build/*.html
+          if-no-files-found: warn
+          retention-days: 14
 
   release:
     needs: build
@@ -99,9 +120,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifacts
+      - name: Download release artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: release-*
           path: artifacts
           merge-multiple: true
 

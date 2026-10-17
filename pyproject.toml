@@ -35,9 +35,17 @@ build = [
 [tool.poe]
 executor = { type = "uv", group = ["dev", "extra"] }
 
-[tool.poe.tasks.main]
+[tool.poe.tasks.run]
 help = "Entry point"
 script = "GSnap:main"
+
+[tool.poe.tasks.textual]
+help = "Debug with textual dev mode"
+cmd = "textual run --dev GSnap:SnapTUI"
+
+[tool.poe.tasks.console]
+help = "Debug with textual console"
+cmd = "textual console"
 
 [tool.poe.tasks._mkdir]
 script = "os:makedirs('build', exist_ok=True)"
@@ -49,33 +57,6 @@ sequence = [
     { cmd = "viztracer --tracer_entries 100000000 -o build/trace.json.gz -- GSnap.py $POE_EXTRA_ARGS" }
 ]
 
-[tool.poe.tasks.textual]
-help = "Debug with textual dev mode"
-cmd = "textual run --dev GSnap:SnapTUI"
-
-[tool.poe.tasks.console]
-help = "Debug with textual console"
-cmd = "textual console"
-
-[tool.poe.tasks.build]
-help = "Build APP with nuitka (Windows Only: CUI)"
-cmd = "nuitka GSnap.py"
-executor = { exact = true, no-group = "dev", group = ["extra", "build"] }
-
-[tool.poe.tasks.build-gui]
-help = "Build GUI with nuitka (Windows Only: GUI)"
-control.expr = "sys.platform"
-default = "pass"
-
-    [[tool.poe.tasks.build-gui.switch]]
-    case = "win32"
-    ref = "build"
-    env = { SUBSYSTEM = "GUI" }
-
-[tool.poe.tasks.build-all]
-help = "Build APP and GUI/CUI"
-sequence = ["build-gui", "build"]
-
 [tool.poe.tasks.view-trace]
 help = "View trace report"
 sequence = [
@@ -83,10 +64,33 @@ sequence = [
     { cmd = "vizviewer build/trace.json.gz $POE_EXTRA_ARGS" }
 ]
 
+[tool.poe.tasks.build]
+help = "Build APP with nuitka"
+cmd = "nuitka GSnap.py"
+executor = { exact = true, no-group = "dev", group = ["extra", "build"] }
+
+[tool.poe.tasks.build-gui]
+help = "Build GUI with nuitka (Windows Only)"
+control.expr = "sys.platform"
+default = "pass"
+
+    [[tool.poe.tasks.build-gui.switch]]
+    case = "win32"
+    cmd = "nuitka GSnap.py --report=build/report-gui.xml $POE_EXTRA_ARGS" # ref = "build"
+    env = { SUBSYSTEM = "GUI" }
+
 [tool.poe.tasks.view-build]
 help = "View build report"
 sequence = [
     "_mkdir",
-    { cmd = "uv tool run nuitka-reporter build/report.xml build/report.html" },
+    { cmd = "uv tool run nuitka-reporter build/report.xml build/report.html $POE_EXTRA_ARGS" },
     { script = "GSnap:browse('build/report.html', True)" }
 ]  # currently nuitka-reporter only render html so we have to manually open it
+
+[tool.poe.tasks.dist]
+help = "Build and pack and test"
+sequence = [
+    { script = "GSnap:run_test" },
+    { sequence = ["build $POE_EXTRA_ARGS", "build-gui $POE_EXTRA_ARGS"] },
+    { script = "GSnap:run_pack" }
+]

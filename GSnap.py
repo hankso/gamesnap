@@ -17,32 +17,42 @@
 #   v0.1.0: add snapshot engine and CLI by argparse
 #
 # Notes for packaging:
-#   On Linux:           apt/dnf/yum install gcc upx ccache patchelf
-#   On Windows:         download upx from https://github.com/upx/upx/releases
+#   On Linux:           apt install gcc upx ccache patchelf python3-tk (or upx-ucl)
+#   On Windows:         choco install upx
 #   For GUI mode:       nuitka GSnap.py
 #   For CUI on cmd:     set SUBSYSTEM=CUI && nuitka GSnap.py
 #   For CUI on pwsh:    $env:SUBSYSTEM = "CUI"; & nuitka GSnap.py
 #   Use uv dep-group:   uv run --no-group dev --group build nuitka GSnap.py
 #   Changed in v0.1.3:  use `poe` to run commands defined in pyproject.toml
 #
-# nuitka-project: --mode=app
-# nuitka-project: --report=build/report.xml
+# nuitka-project: --mode=onefile
+# nuitka-project: --remove-output
 # nuitka-project: --output-dir=build
+# nuitka-project: --output-filename=GameSnap
+# nuitka-project: --output-folder-name=GameSnap
+# nuitka-project: --report=build/report.xml
+# nuitka-project: --python-flag=-u
+#
 # nuitka-project: --enable-plugin=tk-inter
 # nuitka-project: --include-package=rich._unicode_data
-# nuitka-project: --output-filename=GameSnap
-# nuitka-project: --windows-icon-from-ico=icon.png
-# nuitka-project: --include-data-files=icon.png=./
+# nuitka-project: --include-package-data=ttkbootstrap.assets
 # nuitka-project: --include-data-files=pyproject.toml=./
-# nuitka-project-if: __import__('shutil').which('upx') is not None:
+# nuitka-project: --include-data-files=icon.png=./
+#
+# nuitka-project-if: {OS} == 'Darwin':
+#    nuitka-project: --mode=app
+#    nuitka-project: --macos-app-icon=icon.png
+# nuitka-project-if: {OS} != 'Darwin' and __import__('shutil').which('upx') is not None:
 #    nuitka-project: --enable-plugin=upx
 #    nuitka-project: --onefile-no-compression
 # nuitka-project-if: {OS} == 'Windows' and os.getenv('SUBSYSTEM', 'CUI') == 'CUI':
 #    nuitka-project: --windows-console-mode=force
-#    nuitka-project: --output-filename=GameSnapCUI
+#    nuitka-project: --windows-icon-from-ico=icon.png
 # nuitka-project-if: {OS} == 'Windows' and os.getenv('SUBSYSTEM', 'CUI') == 'GUI':
 #    nuitka-project: --windows-console-mode=attach
+#    nuitka-project: --windows-icon-from-ico=icon.png
 #    nuitka-project: --output-filename=GameSnapGUI
+#    nuitka-project: --output-folder-name=GameSnapGUI
 
 # built-in
 import os
@@ -77,9 +87,11 @@ import dataclasses
 import configparser
 import tkinter as tk
 import urllib.request
+from io import BufferedWriter
 from tkinter import font, filedialog, simpledialog, messagebox
 from datetime import datetime
 from contextlib import suppress, contextmanager
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 
 # required: psutil keyboard textual watchdog ttkbootstrap
@@ -183,6 +195,26 @@ logger.addHandler(RichHandler(
 ))
 
 
+def ensure_utf8():
+    '''
+    Rich output usually contains unicode thus requires UTF-8 IO encoding.
+    On legacy windows or piped stdout/stderr, rich.console.Console will
+    try to catch UnicodeError and suggest PYTHONIOENCODING=utf-8.
+    This function fix encoding without depending on environment variables.
+    Also validate that nuitka compiled this program with python flag -u.
+    '''
+    for stream in (sys.stdout, sys.stderr):
+        with suppress(AttributeError):
+            if stream.encoding and stream.encoding.lower() != 'utf-8':
+                stream.reconfigure(encoding='utf-8', errors='replace')
+            buffered = isinstance(stream.buffer, BufferedWriter)
+            if ONEFILE and buffered:
+                logger.error(f'{stream.name.upper()}: {stream.buffer}', file=stream)
+
+
+ensure_utf8()
+
+
 def load(path: Path) -> dict:
     '''Deserialize data from file to a dict'''
     if path.suffix == '.zstd':
@@ -211,7 +243,7 @@ def dump(data: dict, path: Path) -> Path:
 def tailf(path: Path, intv: float = 0.1, create: bool = True) -> threading.Event:
     '''Watch a file and print new lines like `tail -f`'''
     def wrapper(evt) -> None:
-        with open(path) as f:
+        with open(path, encoding='utf-8') as f:
             f.seek(0, 2)
             while not evt.wait(intv):
                 if line := f.readline():
@@ -313,7 +345,7 @@ def console(show: bool, title: str = '') -> bool:
     hwnd = kernel32.GetConsoleWindow()
     if not show:
         if hwnd and user32.ShowWindow(hwnd, 0):     # SW_HIDE
-            atexit.register(lambda h=hwnd: user32.ShowWindow(h, 1))
+            atexit.register(lambda h: user32.IsWindow(h) and user32.ShowWindow(h, 1), hwnd)
         return True
     if hwnd:
         user32.ShowWindow(hwnd, 1)                  # SW_SHOW
@@ -330,12 +362,17 @@ def console(show: bool, title: str = '') -> bool:
         sys.stdin = open('CONIN$', 'r', encoding='utf-8')
         sys.stdout = open('CONOUT$', 'w', encoding='utf-8')
         sys.stderr = open('CONOUT$', 'w', encoding='utf-8')
-        kernel32.SetConsoleCP(65001)
-        kernel32.SetConsoleOutputCP(65001)      # UTF-8
+        kernel32.SetConsoleCP(65001)                # UTF-8
+        kernel32.SetConsoleOutputCP(65001)          # UTF-8
         title and kernel32.SetConsoleTitleW(title)
         return True
     except Exception:
         return False
+
+
+def lprint(it: typing.Iterable) -> None:
+    '''Consume and print each elements of the iterable'''
+    deque(map(rprint, it), maxlen=0)
 
 
 def browse(path: str | Path | None = None, start: bool = False) -> None:
@@ -439,7 +476,7 @@ def poolmap(ntask: int | typing.Iterable[typing.Any] = -1) -> typing.Callable[..
         e = ThreadPoolExecutor(thread_name_prefix='poolmap')
         m = e.map
     else:
-        e, m = None, lambda *a, **k: list(map(*a))  # consume
+        e, m = None, lambda *a, **k: list(map(*a))
     try:
         yield m
     finally:
@@ -455,6 +492,8 @@ def pidfile(path: str | Path | None, singleton: bool = True) -> None:
     path = abspath(path).touchp()
     with suppress(OSError, ValueError, psutil.NoSuchProcess, psutil.AccessDenied), open(path) as f:
         last, this = psutil.Process(int(f.read())), psutil.Process(os.getpid())
+        # different version of executables could cause singleton violation
+        # FIXME: do NOT just compare argv[0]
         if last.cmdline()[0] == this.cmdline()[0] and singleton:
             raise RuntimeError('Already running')
     with open(path, 'w') as f:
@@ -476,7 +515,7 @@ def redirect(path: str | Path | None, stderr: bool = True, tee: bool = False) ->
     path = abspath(path).touchp()
     origin = (sys.stdout, sys.stderr)
     try:
-        sys.stdout = sys.stderr = open(path, 'w', buffering=1, encoding='utf8')
+        sys.stdout = sys.stderr = open(path, 'w', buffering=1, encoding='utf-8')
         if tee:
             with tailf(path, create=False):
                 yield
@@ -562,29 +601,58 @@ def play_sound(snd: int | str | Path = 0, dtms: int = 300) -> None:
         play_sound.proc = proc
 
 
+def size_format(size: int, sep: str = ' ', dem: int = 2, exp: int = 1024) -> str:
+    '''Convert size in bytes to human-readable string'''
+    for unit in ' KMGT':
+        if size < exp:
+            return f'{size:.{dem * (unit != " ")}f}{sep}{unit}B'
+        size /= exp
+    return f'{size:.{dem}f}{sep}PB'
+
+
 def tree_mtime(root: str | Path, mtime: float = 0) -> float:
     '''Recursively get the newest modified time under the tree'''
-    with suppress(OSError), os.scandir(root) as it:
-        for e in it:
-            if e.is_file(follow_symlinks=True):
+    stack = deque([abspath(root)])
+    while stack:
+        with suppress(OSError), os.scandir(stack.pop()) as it:
+            for e in it:
                 mtime = max(mtime, e.stat().st_mtime)   # cached per entry
-            elif e.is_dir(follow_symlinks=False):       # avoid recursion
-                mtime = max(mtime, tree_mtime(e.path, e.stat().st_mtime))
+                if e.is_dir(follow_symlinks=False):     # avoid recursion
+                    stack.append(e.path)
     return mtime
 
 
-def size_format(size: int) -> str:
-    '''Convert size in bytes to human-readable string'''
-    for i in range(3, 0, -1):
-        if size > 2**(i * 10):
-            return f'{size / 2**(i * 10):.2f} {" KMG"[i]}B'
-    return f'{size} B'
+def tree_files(root: str | Path, level: int = -1) -> typing.Iterator[str]:
+    '''List files like `ls -lh` + `tree -Dh`'''
+    try:
+        path = abspath(root)
+        st = path.stat()
+    except OSError:
+        return
+    stack = deque([(path.name, path, path.is_dir(), st.st_mode, st.st_size, st.st_mtime, '', 1, 0)])
+    while stack:
+        name, path, is_dir, mode, size, mtime, prefix, last, depth = stack.pop()
+        conn = ('└── ' if last else '├── ') if depth else ''
+        sstr, tstr = size_format(size), strftime(mtime)
+        yield f'{os.path.stat.filemode(mode)} {sstr:>9s} {tstr} {prefix}{conn}{name}'
+        if not is_dir or depth >= level >= 0:
+            continue
+        prefix += ('    ' if last else '│   ') if depth else ''
+        with suppress(OSError), os.scandir(path) as it:
+            for i, e in enumerate(
+                sorted(it, key=lambda e: (e.is_dir(), e.name.lower()), reverse=True)
+            ):
+                st = e.stat()
+                stack.append((
+                    e.name, e.path, e.is_dir(follow_symlinks=False),
+                    st.st_mode, st.st_size, st.st_mtime, prefix, not i, depth + 1
+                ))
 
 
 def exec_command(*a, **k) -> subprocess.Popen:
     '''Execute command and return the unstopped process'''
-    return subprocess.Popen([i for i in map(str, a)], **{
-        'text': True, 'encoding': 'utf8',
+    return subprocess.Popen(list(map(str, a)), **{
+        'text': True, 'encoding': 'utf-8',
         'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT, **k
     })
 
@@ -600,25 +668,25 @@ def exec_result(*a, timeout: int | None = None, **k) -> str:
             proc.kill()
 
 
-def line_buffer(*cmd, check: bool = False, **k) -> typing.Iterator[str]:
-    '''Execute command and ensure stdout to be line buffered using PTY'''
+def line_buffer(*cmd, check: bool = True, force: bool = True, **k) -> typing.Iterator[str]:
+    '''Execute command and force stdout to be line buffered using PTY'''
     tpl = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     k.setdefault('bufsize', 1)
-    if pty is not None:                                     # unix pty
+    if force and pty is not None:                           # unix pty
         mfd, sfd = pty.openpty()
-        with subprocess.Popen([i for i in map(str, cmd)], **{
+        with subprocess.Popen(list(map(str, cmd)), **{
             **k, 'stdout': sfd, 'stderr': subprocess.STDOUT, 'pass_fds': [sfd]
-        }) as proc, os.fdopen(mfd, 'r', buffering=1, encoding='utf8') as fobj:
+        }) as proc, os.fdopen(mfd, 'r', buffering=1, encoding='utf-8') as fobj:
             os.close(sfd)
             try:
-                for line in fobj:
-                    if line := tpl.sub('', line.rstrip()):
-                        yield line
+                yield from filter(None, map(lambda t: tpl.sub('', t.rstrip()), fobj))
             except OSError as e:
                 if e.errno != 5:  # EIO is treated as EOF
                     raise
     else:
-        if WINDOWS:                                         # winpty or conpty
+        if not force:
+            pass
+        elif WINDOWS:                                       # winpty or conpty
             if git := shutil.which('git'):
                 winpty = abspath(f'{git}/../../usr/bin/winpty.exe')
             else:
@@ -630,9 +698,7 @@ def line_buffer(*cmd, check: bool = False, **k) -> typing.Iterator[str]:
         elif stdbuf := shutil.which('stdbuf'):              # coreutils
             cmd = [stdbuf, '-oL', *cmd]
         with exec_command(*cmd, **k) as proc:
-            for line in proc.stdout:
-                if line := tpl.sub('', line.rstrip()):
-                    yield line
+            yield from filter(None, map(lambda t: tpl.sub('', t.rstrip()), proc.stdout))
     if (rc := proc.poll()) and check:
         raise subprocess.CalledProcessError(rc, proc.args)
 
@@ -647,18 +713,22 @@ def walk_filter(root: str | Path, incs: str = '', excs: str = '') -> typing.Iter
     if path.is_file():
         if inc(path.name) and not exc(path.name):
             yield path
-    elif path.is_dir():
-        def wrapper(r):
-            with suppress(OSError), os.scandir(r) as it:
-                for e in it:
-                    if e.is_file(follow_symlinks=False) and inc(e.name) and not exc(e.name):
-                        yield Path(e.path)
-                    elif e.is_dir(follow_symlinks=False) and not exc(e.name):
-                        yield from wrapper(e.path)
-        yield from wrapper(path)  # faster than os.walk because e.path is cached
-        #  for root, dirs, files in os.walk(path):
-        #      dirs[:] = [d for d in dirs if not exc(d)]
-        #      yield from (Path(root + '/' + fn) for fn in files if inc(fn) and not exc(fn))
+        return
+    if not path.is_dir():
+        return
+    # Method A
+    #  for root, dirs, files in os.walk(path):
+    #      dirs[:] = [d for d in dirs if not exc(d)]
+    #      yield from (Path(root + '/' + fn) for fn in files if inc(fn) and not exc(fn))
+    # Method B (faster)
+    stack = deque([path])
+    while stack:
+        with suppress(OSError), os.scandir(stack.pop()) as it:
+            for e in it:
+                if e.is_file(follow_symlinks=False) and inc(e.name) and not exc(e.name):
+                    yield Path(e.path)
+                elif e.is_dir(follow_symlinks=False) and not exc(e.name):
+                    stack.append(e.path)
 
 
 def cached_property(func: typing.Callable) -> functools.cached_property:
@@ -1323,7 +1393,7 @@ class SnapBroker(object):
         '''
         data = {'games': {}, 'extra': {}, 'result': ''}
         info = configparser.ConfigParser(default_section='Info')
-        with suppress(OSError), open(abspath(path), encoding='utf8') as f:
+        with suppress(OSError), open(abspath(path), encoding='utf-8') as f:
             for row in csv.reader(f, delimiter='#'):
                 if not row:
                     continue
@@ -2650,6 +2720,10 @@ class SnapGUI(ttk.Window, UIMixin):
 
         @ctypes.WINFUNCTYPE(wtypes.LPARAM, *WNDARGS)
         def callback(hwnd, msg, wparam, lparam) -> wtypes.LPARAM:
+            # FIXME: Fatal Python error: PyEval_RestoreThread: the function must
+            # be called with the GIL held, after Python initialization and before
+            # Python finalization, but the GIL is released (the current Python
+            # thread state is NULL) Python runtime state: initialized
             if msg == 0x02E0 or msg == 0x02E3:  # WM_DPICHANGED[_AFTERPARENT]
                 def wrapper(dpi: int) -> None:
                     old, new = self._old_scale, (dpi / 96) or self.winfo_scale()
@@ -2987,7 +3061,7 @@ def find_mods(root: Path, gid: int = 0) -> dict[int, list[tuple[int, int, str, P
     gstr = gid and str(gid) or ''
     mods, cache = {}, {}
     for acf in root.parent.glob('appworkshop_*.acf'):
-        with suppress(Exception), open(acf) as f:
+        with suppress(Exception), open(acf, encoding='utf-8') as f:
             cache.update(json.loads(re.sub(r'"(\d+)"(?!:)', lambda m: m.group(1), re.sub(
                 r'([}"])(\s*)(["{])', lambda m: m.expand(
                     f'\\1{":" if "{" in m.group() or "\n" not in m.group() else ","}\\3'
@@ -3048,8 +3122,7 @@ def steam_cmd(cmd: Path, yes: bool = False) -> Path | None:
         logger.info(msg.as_string().strip())
         shutil.unpack_archive(path, cmd.parent)
         logger.warning('It may take a few minutes to setup SteamCMD...')
-        for line in line_buffer(cmd, '--help', check=True):
-            rprint(line)
+        lprint(line_buffer(cmd, '--help'))
         return cmd
     except Exception:
         cmd.unlink(missing_ok=True)
@@ -3164,7 +3237,7 @@ def run_modman(args: argparse.Namespace, _: SnapBroker) -> None:
                 f'workshop_download_item {gid} {wid}' for wid, gid in wids.items()
             ]).encode())
             script.close()
-            for line in line_buffer(cmd, f'+runscript "{script.name}"', '+quit'):
+            for line in line_buffer(cmd, f'+runscript "{script.name}"', '+quit', check=False):
                 if 'error' in line.lower():
                     logger.error(line[0 if args.verbose else 7:])
                 elif args.verbose:
@@ -3202,7 +3275,7 @@ def run_modman(args: argparse.Namespace, _: SnapBroker) -> None:
                     logger.info(f'[yellow]~[/] {local_link(dst, dst.name)}')
                 else:
                     logger.info(f'[green]+ {local_link(dst, dst.name)}[/]')
-        for mod in olds.difference(mods.values()):
+        for mod in sorted(olds.difference(mods.values())):
             logger.warning(f'[red]- {local_link(args.copy / mod, mod)}[/]')
 
 
@@ -3260,13 +3333,18 @@ except Exception:
             return self._ver[3] is not None and o._ver[3] is None
 
 
-def asset_name(tpl: str, version: str | Version) -> str:
+def asset_name(
+    tpl: str = '{name}-{ver}-{plat}-{arch}{ext}', version: str | Version = VERSION
+) -> str:
     system, machine = platform.system().lower(), platform.machine().lower()
+    if machine in ('arm', 'armv8', 'aarch64'):
+        machine = 'arm64'
+    if machine in ('x64', 'win64', 'x86_64', 'x86-64'):
+        machine = 'amd64'
     return tpl.format(
-        name=PROJECT, plat='macos' if system == 'darwin' else system,
-        arch={'aarch64': 'arm64', 'arm64': 'arm64'}.get(machine, 'x86_64'),
-        ver=version, ext='.exe' if WINDOWS else ''
-    )
+        name=PROJECT, ver=version, ext='.exe' if WINDOWS else '',
+        plat='macos' if system == 'darwin' else system, arch=machine or 'amd64',
+    ).strip()
 
 
 def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
@@ -3287,7 +3365,7 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
         if '{name}' not in args.match:
             args.match = ('{name}-' + args.match).replace('--', '-')
         info = dump({'tag_name': VERSION, 'assets': [{
-            'name': asset_name(args.match, VERSION),
+            'name': asset_name(args.match),
             'size': path.stat().st_size,
             'digest': 'md5:' + hashlib.md5(path.read_bytes()).hexdigest(),
             'updated_at': strftime(path.stat().st_mtime, '%FT%XZ'),
@@ -3296,7 +3374,7 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
         logger.info(info.read_text())
         return 'Test with --url=' + info.parent.as_uri()
     if args.ppid:
-        logger.info(f'Welcome to {VERSION}')
+        logger.info(f'Welcome to v{VERSION}')
         if not args.keep:
             with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                 psutil.Process(args.ppid).wait(5)
@@ -3317,8 +3395,8 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
     except Exception:
         return logger.exception(f'Failed to fetch version from {args.url or args.repo}')
     if not args.force and newver <= VERSION:
-        return logger.info(f'Skip version {newver}')
-    logger.info(f'Found verseion {newver} (current {VERSION})')
+        return logger.info(f'Skip version v{newver}')
+    logger.info(f'Found verseion v{newver} (current v{VERSION})')
     suffix = asset_name(args.match, newver)
     for asset in assets:
         if asset['name'].endswith(suffix):
@@ -3349,8 +3427,9 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
     try:
         if not WINDOWS:
             target.chmod(current.stat().st_mode if ONEFILE else 0o755)
-        for line in line_buffer(target, 'runtest', '--console', 'hide', check=True):
-            rprint(line)
+        # this program is already compiled with python -u flag thus unbuffered
+        # here we use line_buffer just to rprint log lines and check returncode
+        lprint(line_buffer(target, 'test', force=False))
     except Exception:
         target.unlink()
         return logger.error('Self-test failed: skip this version')
@@ -3384,11 +3463,46 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
         target.unlink()
         return logger.exception('Failed to replace executable')
     argv = [str(target), sys.argv[1], '--ppid', str(os.getpid()), *args.args]
-    logger.info(f'Goodbye from {VERSION}')
+    logger.info(f'Goodbye from v{VERSION}')
     return os.execv(argv[0], argv) if ONEFILE else logger.debug(f'Running {argv}')
 
 
-def run_test(_: argparse.Namespace, brok: SnapBroker) -> None:
+def run_pack(*a) -> None:
+    '''find and rename and test artifacts'''
+    base = BASEDIR / 'build' / 'GameSnap'
+    dst = (BASEDIR / 'dist').mkdirp() / asset_name()
+    dzip = dst.with_suffix('.zip') if WINDOWS else Path(f'{dst}.zip')
+    for src in base.parent.iterdir():
+        if src.suffix.lower() in {'.msi', '.dmg', '.appimage'}:
+            shutil.copy2(src, dst.with_suffix(src.suffix))
+    if (exe := base.with_suffix('.exe')).is_file():     # windows onefile
+        shutil.copy2(exe, dst)
+        with PZipFile(dzip, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.write(exe, exe.name)
+            if (gui := base.with_name('GameSnapGUI.exe')).is_file():
+                zf.write(gui, gui.name)
+                shutil.copy2(gui, dst.with_name(dst.name.replace('GameSnap', 'GameSnapGUI')))
+    if (app := base.with_suffix('.app')).is_dir():      # macOS app bundle
+        macho = app / f'Contents/MacOS/{app.stem}'
+        lprint(line_buffer(macho, 'test', force=False))
+        if ditto := shutil.which('ditto'):
+            lprint(line_buffer(ditto, '-c', '-k', '--keepParent', app, dzip))
+        else:
+            shutil.make_archive(dst.with_suffix(''), 'zip', app.parent, app.name)
+    if (elf := base.with_suffix('')).is_file():         # linux onefile
+        shutil.copy2(elf, dst)
+        with PZipFile(dzip, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zf.write(elf, elf.name)
+    lprint(tree_files(base.parent, level=2))
+    lprint(tree_files(dzip.parent))
+    if dzip.is_file():
+        logger.info(f'Packed {dzip}')
+    if dst.is_file():
+        logger.info(f'Copied {dst}')
+        lprint(line_buffer(dst, 'test', force=False))
+
+
+def run_test(*a) -> None:
     '''self-test and report errors'''
     with tempfile.TemporaryDirectory() as folder:
         base = Path(folder)
@@ -3397,11 +3511,11 @@ def run_test(_: argparse.Namespace, brok: SnapBroker) -> None:
         hdir = bdir / 'blob'
         code = sdir / 'code.py'
         text = sdir / 'text.md'
-        cfg = base / 'config.json'
         out = base / 'export.zip'
+        cfg = base / CFGFILE.name
         logger.info('TEST START'.center(20, '-'))
         try:
-            brok.update(cfg)
+            brok = SnapBroker(cfg)
             assert cfg.is_file(), 'config file is not created'
             brok['knew'] = brok['ktog'] = brok['kdel'] = ''  # disable hotkey
 
@@ -3482,10 +3596,7 @@ def run_test(_: argparse.Namespace, brok: SnapBroker) -> None:
             data = list(brok.summary()[0].info.values())[0]
             assert not data[0].exists() or not any(data[1:]), 'blob files missing'
         except Exception:
-            logger.exception('\n'.join(
-                f'{path.relative_to(base)} [{size_format(path.stat().st_size)}]'
-                for path in sorted(base.rglob('*'))
-            ))
+            logger.exception('\n'.join(tree_files(base)))
             return 1
         finally:
             logger.info('TEST DONE'.center(20, '-'))
@@ -3506,7 +3617,7 @@ def run_summary(args: argparse.Namespace, brok: SnapBroker) -> str:
     for snap in snaps:
         if args.size:
             rsize, dsize = sum(v[1] for v in snap.flat.values()), snap.size
-            size = f'{size_format(dsize)} <= {size_format(rsize)} ({dsize / rsize:.2%})'
+            size = f'{size_format(dsize):>9s} <= {size_format(rsize):>9s} ({dsize / rsize:.2%})'
         else:
             size = ''
         rprint(strftime(snap.time), f'{snap.type:6s}', snap.fcnt, 'files', size)
@@ -3522,7 +3633,7 @@ def run_summary(args: argparse.Namespace, brok: SnapBroker) -> str:
             (snap.path.stat().st_size for snap in snaps),
             {k: v[1] for snap in snaps for k, v in snap.info.items()}.values()
         ))
-        msg += f' {size_format(dsize)}'
+        msg += f' {size_format(dsize):>9s}'
     return msg
 
 
@@ -3645,6 +3756,20 @@ def make_parser() -> ArgumentParser:
     )
     parser.set_defaults(task=run_gui, func=None)
 
+    s = parser.add_subparser('gui', help='run graphical user interface (default)')
+    s.set_defaults(task=run_gui)
+
+    s = parser.add_subparser('tui', help='run terminal user interface')
+    s.add_argument('--css', type=filepath, nargs='+', help='load .tcss for debugging')
+    s.set_defaults(task=lambda a, b: SnapTUI(css=a.css, brok=b).run())
+
+    s = parser.add_subparser('daemon', help='run without user interface')
+    s.add_argument('--log', metavar='PATH', type=abspath, help='redirect stdout to logfile')
+    s.add_argument('--pid', metavar='PATH', nargs='?', type=abspath,
+                   const=abspath(tempfile.gettempdir()) / PROJECT.lower(),
+                   help='use and verify pidfile (default: [i]%(const)s[/])')
+    s.set_defaults(task=run_daemon)
+
     s = parser.add_subparser('create', help='create a manual snapshot')
     s.set_defaults(func=lambda a, b: f'Created {b.create()}')
 
@@ -3674,9 +3799,6 @@ def make_parser() -> ArgumentParser:
     s.add_argument('--size', action='store_true', help='show detail of size info')
     s.set_defaults(func=run_summary)
 
-    s = parser.add_subparser('runtest', help=run_test.__doc__, parents=[gopt])
-    s.set_defaults(task=run_test)
-
     steamcmd = shutil.which('steamcmd' + steam_cmd.suffix) or shutil.which('steamcmd')
     steamcmd = abspath(steamcmd or f'~/.steamcmd/steamcmd{steam_cmd.suffix}')
     s = parser.add_subparser('modman', help=run_modman.__doc__, parents=[gopt])
@@ -3697,7 +3819,8 @@ def make_parser() -> ArgumentParser:
 
     s = parser.add_subparser('update', help=run_update.__doc__, parents=[gopt])
     s.add_argument('args', nargs=argparse.REMAINDER, help='arguments to pass through')
-    s.add_argument('--match', metavar='TPL', default='-{plat}-{arch}{ext}',
+    s.add_argument('--match', metavar='TPL',
+                   default=inspect.signature(asset_name).parameters['tpl'].default,
                    help='asset template [[i]name, plat, arch, ver, ext[/]] (default %(default)s)')
     s.add_argument('--force', action='store_true', help='force update to legacy versions')
     s.add_argument('--keep', action='store_true', help='do not clean up old versions')
@@ -3709,19 +3832,8 @@ def make_parser() -> ArgumentParser:
     g.add_argument('--gen', metavar='DIR', type=abspath, help='generate version info')
     s.set_defaults(func=run_update)
 
-    s = parser.add_subparser('daemon', help='run without user interface')
-    s.add_argument('--log', metavar='PATH', type=abspath, help='redirect stdout to logfile')
-    s.add_argument('--pid', metavar='PATH', nargs='?', type=abspath,
-                   const=abspath(tempfile.gettempdir()) / PROJECT.lower(),
-                   help='use and verify pidfile (default: [i]%(const)s[/])')
-    s.set_defaults(task=run_daemon)
-
-    s = parser.add_subparser('tui', help='run terminal user interface')
-    s.add_argument('--css', type=filepath, nargs='+', help='load .tcss for debugging')
-    s.set_defaults(task=lambda a, b: SnapTUI(css=a.css, brok=b).run())
-
-    s = parser.add_subparser('gui', help='run graphical user interface (default)')
-    s.set_defaults(task=run_gui)
+    s = parser.add_subparser('test', help=run_test.__doc__, parents=[gopt])
+    s.set_defaults(task=run_test)
     return parser
 
 
@@ -3733,7 +3845,9 @@ def main() -> int:
         console({'show': True, 'hide': False}.get(
             args.console, args.func or args.task is not run_gui
         ), ' '.join(APPINFO[:0 if args.func else 2]))
-        if not args.config.is_file() and args.config != CFGFILE:
+        if args.func in {run_modman, run_update} or args.task is run_test:
+            args.config = None
+        elif not args.config.is_file() and args.config != CFGFILE:
             logger.warning(f'{args.config} does not exist: fallback to {CFGFILE}')
             args.config = CFGFILE
         if args.serial:
@@ -3743,7 +3857,6 @@ def main() -> int:
         if args.preset:
             logger.info(brok.preset(args.preset[0], args.preset[1])['result'])
         if args.param:
-            logger.debug(f'Override params: {args.param}')
             brok.update(dict(args.param))
         if not args.func:
             return args.task(args, brok)
