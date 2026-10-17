@@ -7,24 +7,25 @@
 # Time: 2026/4/1 0:16:44
 #
 # Versions:
+#   v0.2.2: add support to switch between configs
+#   v0.2.1: add filename filter like --includes *.py;*.md or --excludes *.bin
+#   v0.2.0: SnapRecord: storage tree instead of paths to save space
+#   v0.1.4: add support to self-update from url or github repo
 #   v0.1.3: add modman and daemon mode and tested on linux
-#   v0.1.2: add Terminal UI (textual)
+#   v0.1.2: add Terminal UI (textual) and pyproject.toml
 #   v0.1.1: add Graphical UI (tkinter) and build with nuitka
 #   v0.1.0: add snapshot engine and CLI by argparse
 #
-# Notes for packaging on Windows:
+# Notes for packaging:
+#   On Linux:           apt/dnf/yum install gcc upx ccache patchelf
+#   On Windows:         download upx from https://github.com/upx/upx/releases
 #   For GUI mode:       nuitka GSnap.py
 #   For CUI on cmd:     set SUBSYSTEM=CUI && nuitka GSnap.py
 #   For CUI on pwsh:    $env:SUBSYSTEM = "CUI"; & nuitka GSnap.py
 #   Use uv dep-group:   uv run --no-group dev --group build nuitka GSnap.py
 #   Changed in v0.1.3:  use `poe` to run commands defined in pyproject.toml
 #
-# TODO:
-#   1. make sure GameSnapEngine works when sdir is a file, i.e. backup one file
-#   2. GameSnapEngine.summary(detail=True) is not concurrent and slow
-#   3. write more function docs
-#
-# nuitka-project: --onefile
+# nuitka-project: --mode=app
 # nuitka-project: --report=build/report.xml
 # nuitka-project: --output-dir=build
 # nuitka-project: --enable-plugin=tk-inter
@@ -36,12 +37,12 @@
 # nuitka-project-if: __import__('shutil').which('upx') is not None:
 #    nuitka-project: --enable-plugin=upx
 #    nuitka-project: --onefile-no-compression
-# nuitka-project-if: {OS} == 'Windows' and os.getenv('SUBSYSTEM', 'GUI') == 'GUI':
-#    nuitka-project: --windows-console-mode=attach
-#    nuitka-project: --output-filename=GameSnapGUI
-# nuitka-project-if: {OS} == 'Windows' and os.getenv('SUBSYSTEM', 'GUI') == 'CUI':
+# nuitka-project-if: {OS} == 'Windows' and os.getenv('SUBSYSTEM', 'CUI') == 'CUI':
 #    nuitka-project: --windows-console-mode=force
 #    nuitka-project: --output-filename=GameSnapCUI
+# nuitka-project-if: {OS} == 'Windows' and os.getenv('SUBSYSTEM', 'CUI') == 'GUI':
+#    nuitka-project: --windows-console-mode=attach
+#    nuitka-project: --output-filename=GameSnapGUI
 
 # built-in
 import os
@@ -53,28 +54,32 @@ import time
 import queue
 import atexit
 import ctypes
+import signal
 import shutil
+import struct
 import typing
+import fnmatch
 import hashlib
+import pathlib
 import inspect
 import logging
 import tomllib
 import zipfile
 import argparse
+import platform
 import tempfile
+import functools
 import itertools
 import threading
 import subprocess
+import http.server
 import dataclasses
-import urllib.request
+import configparser
 import tkinter as tk
-from pathlib import Path as _Path
-from tkinter import font, filedialog, messagebox
+import urllib.request
+from tkinter import font, filedialog, simpledialog, messagebox
 from datetime import datetime
-from functools import cached_property
 from contextlib import suppress, contextmanager
-from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
-from configparser import ConfigParser
 from concurrent.futures import ThreadPoolExecutor
 
 # required: psutil keyboard textual watchdog ttkbootstrap
@@ -110,20 +115,21 @@ try:
 except Exception:
     json_repair = None
 try:
-    import winsound
+    import winsound                 # windows only
 except Exception:
     winsound = None
 try:
-    import winreg
+    import winreg                   # windows only
 except Exception:
     winreg = None
 try:
-    import pty
+    import pty                      # unix only
 except Exception:
     pty = None
 
 
-class Path(_Path):
+class Path(pathlib.Path):
+    '''Wrapping on pathlib.Path to ensure posix flavour __str__'''
     def __str__(self) -> str:
         return super().__str__().replace(self._flavour.sep, '/')
 
@@ -134,27 +140,37 @@ class Path(_Path):
         return self.parent.mkdirp().touch(mode, exist_ok=True) or self
 
 
+def abspath(path: str | Path) -> Path:
+    '''Expand environ vars and user home directory and resolve the path'''
+    return Path(os.path.expandvars(str(path).strip('\'" \n\r\t'))).expanduser().resolve()
+
+
 try:
-    BASEDIR = Path(__compiled__.containing_dir).resolve()   # noqa: F821 onefile parent
-    DATADIR = Path(__file__).parent.resolve()               # inside onefile
+    compiled = globals()['__compiled__']
+    ONEFILE = compiled.onefile
+    BASEDIR = abspath(compiled.containing_dir)  # onefile parent
+    DATADIR = abspath(__file__).parent          # inside onefile
 except Exception:
-    BASEDIR = DATADIR = Path(__file__).parent.resolve()
+    ONEFILE = False
+    BASEDIR = DATADIR = abspath(__file__).parent
 ICOFILE = DATADIR / 'icon.png'
 CFGFILE = BASEDIR / 'config.json'
-WINDOWS = sys.platform == 'win32'
+WINDOWS = platform.system() == 'Windows'
 POOLMAP = True
 try:
-    with open(DATADIR / 'pyproject.toml', 'rb') as _f:
-        _data = tomllib.load(_f)['project']
-    PROJECT = _data['name']
-    VERSION = _data['version']
-    DESCSTR = _data['description']
+    with open(DATADIR / 'pyproject.toml', 'rb') as f:
+        data = tomllib.load(f)['project']
+    PROJECT = data['name']
+    VERSION = data['version']
     AUTHORS = ', '.join(
         f'{author.get("name", "")} <{author.get("email", "")}>'
-        for author in _data['authors']
+        for author in data['authors']
     )
+    DESCSTR = data.get('description', '')
+    REPOURL = data.get('urls', {}).get('repository', '')
 except Exception:
-    PROJECT, VERSION, AUTHORS, DESCSTR = Path(__file__).stem, '0.0.0', 'UNKNOWN', ''
+    PROJECT, VERSION, AUTHORS = Path(__file__).stem, '0.0.0', 'UNKNOWN'
+    DESCSTR = REPOURL = ''
 APPINFO = (PROJECT, f'v{VERSION}', f'by {AUTHORS}')
 
 logger = logging.getLogger(PROJECT)
@@ -167,7 +183,8 @@ logger.addHandler(RichHandler(
 ))
 
 
-def jload(path: Path) -> dict:
+def load(path: Path) -> dict:
+    '''Deserialize data from file to a dict'''
     if path.suffix == '.zstd':
         with suppress(Exception), zstd.open(path, 'r') as f:
             return json.load(f)
@@ -177,7 +194,8 @@ def jload(path: Path) -> dict:
     return {}
 
 
-def jdump(data: dict, path: Path) -> Path:
+def dump(data: dict, path: Path) -> Path:
+    '''Serialize data as a binary stream and write to file'''
     if path.suffix == '.zstd':
         enc = json.JSONEncoder(default=str, separators=(',', ':'))
         with zstd.open(path.touchp(), 'wb') as f:
@@ -211,18 +229,28 @@ def tailf(path: Path, intv: float = 0.1, create: bool = True) -> threading.Event
         task.is_alive() and task.join(intv * 2)
 
 
-def pidof(name: str) -> int:
-    '''Get process id of specified program or executable (case ignored)'''
-    name = str(name).lower()
+def pidof(target: str) -> int:
+    '''Query the process id of program name or executable path (case ignored)'''
+    target = abspath(target).name.lower()
     with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
         for proc in psutil.process_iter(['name']):
-            if name in proc.info['name'].lower():
+            if target in proc.info['name'].lower():
                 return proc.pid
     return 0
 
 
-def where(path: Path, key: str, default: str = '') -> str:
-    '''Get installed path of a software from registry'''
+def where(path: str, name: str, default: str = '') -> str:
+    '''
+    Query the install location of a software from Windows Registry.
+
+    Args:
+        path (str): registry folder (hkey and subkey)
+        name (str): registry value to query
+        default (str, optional): fallback value if path or name not found (default: '')
+
+    Returns:
+        str: path install location (must be a folder) or default value
+    '''
     if winreg is None:
         return default
     for prefix, hkey in itertools.product(
@@ -230,93 +258,28 @@ def where(path: Path, key: str, default: str = '') -> str:
         (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
     ):
         with suppress(Exception), winreg.OpenKey(hkey, f'{prefix}\\{path}') as ctx:
-            val = abspath(winreg.QueryValueEx(ctx, key)[0])
+            val = abspath(winreg.QueryValueEx(ctx, name)[0])
             if val.is_dir():
                 return str(val)
     return default
 
 
-def browse(path: str | Path, start: bool = False) -> None:
-    '''View directory or select file in explorer or open path link'''
-    path = abspath(path)
-    if WINDOWS:
-        if start:
-            os.startfile(path.as_uri())
-        elif path.is_file():
-            exec_command('explorer', '/select,', str(path).replace('/', os.sep))
-        elif path.is_dir():
-            exec_command('explorer', '/root,', str(path).replace('/', os.sep))
-    elif sys.platform == 'darwin':
-        exec_command('open', '' if start else '-R', path)
-    elif xdg := shutil.which('xdg-open'):
-        exec_command(xdg, path if start else path.parent)
-    elif gnome := shutil.which('gnome-open'):
-        exec_command(gnome, path if start else path.parent)
-
-
-def abspath(path: str | Path) -> Path:
-    '''Expand environ vars and user home directory and resolve the path'''
-    return Path(os.path.expandvars(str(path).strip('\'" \n\r\t'))).expanduser().resolve()
-
-
-def capture(pid: int | str) -> Image.Image | None:
-    '''Take screenshot of prorgam'''
-    hwnds: [int, tuple[int, bool, tuple[int, int, int, int]]] = {}
-    if WINDOWS:
-        user32, gdi32, wtypes = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.wintypes
-
-        @ctypes.WINFUNCTYPE(wtypes.BOOL, wtypes.HWND, wtypes.LPARAM)
-        def callback(hwnd, _) -> bool:
-            pid, rect = wtypes.DWORD(), wtypes.RECT()
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            xyxy = x1, y1, x2, y2 = (rect.left, rect.top, rect.right, rect.bottom)
-            valid = user32.IsWindowVisible(hwnd)
-            hwnds[hwnd] = [pid.value, valid and (x2 - x1) > 1 and (y2 - y1) > 1, xyxy]
-            return True
-        awareness()
-        user32.EnumWindows(callback, 0)
-
-    search = pidof(pid) if isinstance(pid, str) else pid
-    for hwnd, (pid, valid, bbox) in hwnds.items():
-        if pid != search or not valid:
-            continue
-        if not WINDOWS:
-            return ImageGrab.grab(bbox, all_screens=True)
-
-        class BITMAPINFOHEADER(ctypes.Structure):
-            _fields_ = [
-                ('biSize', wtypes.DWORD),
-                ('biWidth', wtypes.LONG),
-                ('biHeight', wtypes.LONG),
-                ('biPlanes', wtypes.WORD),
-                ('biBitCount', wtypes.WORD),
-                ('biCompression', wtypes.DWORD),
-                ('biSizeImage', wtypes.DWORD),
-                ('biXPelsPerMeter', wtypes.LONG),
-                ('biYPelsPerMeter', wtypes.LONG),
-                ('biClrUsed', wtypes.DWORD),
-                ('biClrImportant', wtypes.DWORD),
-            ]
-        size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
-        dch = user32.GetWindowDC(hwnd)
-        mem = gdi32.CreateCompatibleDC(dch)
-        ptr = ctypes.c_void_p()
-        hdr = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), size[0], -size[1], 1, 32, 0)
-        obj = gdi32.CreateDIBSection(mem, ctypes.byref(hdr), 0, ctypes.byref(ptr), None, 0)
-        gdi32.SelectObject(mem, obj)
-        user32.PrintWindow(hwnd, mem, 2)
-        buf = ctypes.string_at(ptr.value, size[0] * size[1] * 4)
-        img = Image.frombuffer('RGB', size, buf, 'raw', 'BGRX', 0, 1)
-        gdi32.DeleteObject(obj)
-        gdi32.DeleteDC(mem)
-        user32.ReleaseDC(hwnd, dch)
-        return img
+def isgui(path: str | Path = sys.argv[0]) -> bool | None:
+    '''Parse PE header and check if executable is GUI subsystem program'''
+    with suppress(Exception), open(abspath(path), 'rb') as f:
+        f.seek(0x3C)                                                # Skip DOS Stub (60)
+        offset = struct.unpack('<I', f.read(4))[0]
+        f.seek(offset)
+        assert f.read(4) == b'PE\x00\x00'
+        f.seek(offset + 0x18)                                       # Skip signature (4) + COFF (20)
+        assert struct.unpack('<H', f.read(2))[0] in [0x10B, 0x20B]  # PE32 & PE32+
+        f.seek(offset + 0x18 + 0x44)                                # Subsystem
+        return struct.unpack('<H', f.read(2))[0] == 2
 
 
 def console(show: bool, title: str = '') -> bool:
     '''
-    Manage console for Windows CUI/GUI subsystem programs.
+    Manage console for Windows GUI/CUI subsystem programs.
 
     Args:
         show (bool): whether to show the console window
@@ -340,7 +303,7 @@ def console(show: bool, title: str = '') -> bool:
         * hide window if parent process has a console (e.g. PowerShell / CMD)
           do nothing if program is started by double-clicking (no console window)
 
-        Use `dumpbin.exe /headers <program>` to check exe mode:
+        Use `dumpbin.exe /headers <program>` or `isgui(<program>)` to check exe mode:
             2 subsystem => Windows GUI
             3 subsystem => Windows CUI
     '''
@@ -375,9 +338,101 @@ def console(show: bool, title: str = '') -> bool:
         return False
 
 
+def browse(path: str | Path | None = None, start: bool = False) -> None:
+    '''
+    View directory or select file in explorer or open path link.
+
+    Args:
+        path (str or Path, optional): path to the folder or file
+        start (bool, optional): whether to open specified path (default: False)
+
+    Notes:
+        If start is False, view folder or file in system explorer.
+        If start is True and path is file, open with default system applications.
+        For example, webbrowser for .html files, notepad for .txt files, etc.
+    '''
+    if path is None or not (path := abspath(path)).exists():
+        return
+    if WINDOWS:
+        if start:
+            os.startfile(path.as_uri())
+        elif path.is_file():
+            exec_result('explorer', '/select,', str(path).replace('/', os.sep))
+        elif path.is_dir():
+            exec_result('explorer', '/root,', str(path).replace('/', os.sep))
+    elif platform.system() == 'Darwin':
+        exec_result('open', '' if start else '-R', path)
+    elif xdg := shutil.which('xdg-open'):
+        exec_result(xdg, path if start else path.parent)
+    elif gnome := shutil.which('gnome-open'):
+        exec_result(gnome, path if start else path.parent)
+
+
+def capture(pid: int | str) -> Image.Image | None:
+    '''Take screenshot of the specified prorgam id or name'''
+    search = pidof(pid) if isinstance(pid, str) else pid
+    if not WINDOWS:
+        return ImageGrab.grab(all_screens=True)  # FIXME: find window bbox
+    hwnds: [int, tuple[int, tuple[int, int, int, int]]] = {}
+    user32, gdi32, wtypes = ctypes.windll.user32, ctypes.windll.gdi32, ctypes.wintypes
+
+    @ctypes.WINFUNCTYPE(wtypes.BOOL, wtypes.HWND, wtypes.LPARAM)
+    def callback(hwnd, _) -> bool:
+        pid, rect = wtypes.DWORD(), wtypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(rect))
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        xyxy = x1, y1, x2, y2 = (rect.left, rect.top, rect.right, rect.bottom)
+        valid = user32.IsWindowVisible(hwnd) and (x2 - x1) > 1 and (y2 - y1) > 1
+        if pid.value == search and valid:
+            hwnds[hwnd] = [pid.value, xyxy]
+        return True
+    awareness()
+    user32.EnumWindows(callback, 0)
+    if not hwnds:
+        return
+
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ('biSize', wtypes.DWORD),
+            ('biWidth', wtypes.LONG),
+            ('biHeight', wtypes.LONG),
+            ('biPlanes', wtypes.WORD),
+            ('biBitCount', wtypes.WORD),
+            ('biCompression', wtypes.DWORD),
+            ('biSizeImage', wtypes.DWORD),
+            ('biXPelsPerMeter', wtypes.LONG),
+            ('biYPelsPerMeter', wtypes.LONG),
+            ('biClrUsed', wtypes.DWORD),
+            ('biClrImportant', wtypes.DWORD),
+        ]
+    hwnd, (pid, bbox) = next(iter(hwnds.items()))
+    size = (bbox[2] - bbox[0], bbox[3] - bbox[1])
+    dch = user32.GetWindowDC(hwnd)
+    mem = gdi32.CreateCompatibleDC(dch)
+    ptr = ctypes.c_void_p()
+    hdr = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), size[0], -size[1], 1, 32, 0)
+    obj = gdi32.CreateDIBSection(mem, ctypes.byref(hdr), 0, ctypes.byref(ptr), None, 0)
+    gdi32.SelectObject(mem, obj)
+    user32.PrintWindow(hwnd, mem, 2)
+    buf = ctypes.string_at(ptr.value, size[0] * size[1] * 4)
+    img = Image.frombuffer('RGB', size, buf, 'raw', 'BGRX', 0, 1)
+    gdi32.DeleteObject(obj)
+    gdi32.DeleteDC(mem)
+    user32.ReleaseDC(hwnd, dch)
+    return img
+
+
+def relpath(path: str | Path, other: str | Path = BASEDIR) -> Path:
+    '''Safe relative path to default BASEDIR'''
+    path = abspath(path)
+    with suppress(ValueError):
+        return path.relative_to(abspath(other), walk_up=True)
+    return path
+
+
 @contextmanager
 def poolmap(ntask: int | typing.Iterable[typing.Any] = -1) -> typing.Callable[..., typing.Iterator]:
-    '''Map tasks in parallel with ThreadPoolExecutor'''
+    '''Run tasks in parallel with ThreadPoolExecutor'''
     if not isinstance(ntask, int):
         ntask = len(ntask) if hasattr(ntask, '__len__') else -1
     if POOLMAP and (ntask < 0 or ntask > os.cpu_count()):
@@ -393,7 +448,7 @@ def poolmap(ntask: int | typing.Iterable[typing.Any] = -1) -> typing.Callable[..
 
 @contextmanager
 def pidfile(path: str | Path | None, singleton: bool = True) -> None:
-    '''Create and write current process id to a pidfile'''
+    '''Write current process id to a file and ensure singleton'''
     if not path:
         yield
         return
@@ -414,7 +469,7 @@ def pidfile(path: str | Path | None, singleton: bool = True) -> None:
 
 @contextmanager
 def redirect(path: str | Path | None, stderr: bool = True, tee: bool = False) -> None:
-    '''Temporary IO stream redirection'''
+    '''Temporary IO stream redirection to a file'''
     if not path:
         yield
         return
@@ -434,6 +489,7 @@ def redirect(path: str | Path | None, stderr: bool = True, tee: bool = False) ->
 
 
 def strftime(dt: datetime | int | float | None = None, fmt: str = '%F %X') -> str:
+    '''Convert datetime or seconds since epoch to formatted string'''
     if isinstance(dt, (int, float)):
         dt = datetime.fromtimestamp(dt)
     elif not isinstance(dt, datetime):
@@ -441,31 +497,55 @@ def strftime(dt: datetime | int | float | None = None, fmt: str = '%F %X') -> st
     return dt.strftime(fmt)
 
 
-def awareness() -> int | None:
-    '''Set process DPI awareness context'''
+def awareness() -> bool:
+    '''Enable process DPI awareness on Windows and return True if success'''
     if not WINDOWS:
-        return
-    with suppress(Exception):       # Win10 1703+
+        return False
+    with suppress(Exception):       # Win10 1607+
         val = ctypes.c_void_p(-4)   # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
-        return ctypes.windll.user32.SetProcessDpiAwarenessContext(val)
+        return ctypes.windll.user32.SetProcessDpiAwarenessContext(val) == 1
     with suppress(Exception):       # Win8.1+
         val = 2                     # PROCESS_PER_MONITOR_DPI_AWARE
-        return ctypes.windll.shcore.SetProcessDpiAwareness(val)
+        return ctypes.windll.shcore.SetProcessDpiAwareness(val) == 0
     with suppress(Exception):       # Win7/Vista
-        return ctypes.windll.user32.SetProcessDPIAware()
+        return ctypes.windll.user32.SetProcessDPIAware() == 1
 
 
 def play_sound(snd: int | str | Path = 0, dtms: int = 300) -> None:
-    '''Play sound alias or wav from file or beep at specified frequency'''
-    if isinstance(snd, int):
-        if not winsound:
-            return
-        if snd < 37 or snd > 32767:
-            return logger.error('Frequency must be in [37 ~ 32767]')
+    '''Play wav file or sound alias or beep at specified frequency'''
+    if not hasattr(play_sound, 'backends'):
+        play_sound.backends = (ps, bp) = ([], [])
+        if winsound:                            # Windows
+            ps.append(lambda s: winsound.PlaySound(s, winsound.SND_ASYNC | winsound.SND_FILENAME))
+            bp.append(lambda f, d: winsound.Beep(int(f), d))
+        if ffplay := shutil.which('ffplay'):    # ffmpeg
+            ps.append(lambda s: exec_command(ffplay, '-nodisp', '-autoexit', s))
+        if afplay := shutil.which('afplay'):    # MacOS
+            ps.append(lambda s: exec_command(afplay, s))
+            bp.append(lambda f, d: exec_result(afplay, '/System/Library/Sounds/Glass.aiff'))
+        if paplay := shutil.which('paplay'):    # Linux PulseAudio
+            ps.append(lambda s: exec_command(paplay, s))
+        if aplay := shutil.which('aplay'):      # Linux ALSA
+            ps.append(lambda s: exec_command(aplay, '-q', s))
+        if beep := shutil.which('beep'):        # Linux beep
+            bp.append(lambda f, d: exec_result(beep, '-f', f, '-l', d))
+        if play := shutil.which('play'):        # Linux sox
+            bp.append(lambda f, d: exec_result(
+                play, '--no-show-progress', '--null', '--channels', '1',
+                'synth', d / 1000, 'sine', f
+            ))
+        bp.append(lambda f, d: print('\a', end='', flush=True))     # terminal bell
+    if isinstance(snd, (int, float)):
+        if isinstance(snd, int) and snd > 0 and snd < 89:           # MIDI Note
+            snd = 440 * pow(2, (snd - 69) / 12)                     # to frequency
         if dtms <= 0:
             return logger.error('Duration must be positive number')
-        return winsound.Beep(snd, dtms)
-    path = Path(str(snd))
+        if snd <= 0:
+            return logger.error('Frequency must be positive')
+        if winsound and (snd < 37 or snd > 32767):
+            return logger.error('Frequency must be in [37 ~ 32767]')
+        return play_sound.backends[1][0](int(snd), int(dtms)) and None
+    path = abspath(str(snd))
     if isinstance(snd, str) and winsound:
         if snd.lower().startswith('mb_') and hasattr(winsound, snd.upper()):
             return winsound.MessageBeep(getattr(winsound, snd.upper()))
@@ -473,82 +553,129 @@ def play_sound(snd: int | str | Path = 0, dtms: int = 300) -> None:
             return winsound.PlaySound(snd, winsound.SND_ASYNC | winsound.SND_ALIAS)
         if not path.is_file():
             return winsound.PlaySound(snd, winsound.SND_ASYNC | winsound.SND_APPLICATION)
-    if not hasattr(play_sound, 'backends'):
-        play_sound.backends = lst = []
-        if winsound:                # Windows
-            lst.append(lambda s: winsound.PlaySound(s, winsound.SND_ASYNC | winsound.SND_FILENAME))
-        if shutil.which('ffplay'):  # ffmpeg
-            lst.append(lambda s: exec_command('ffplay', '-nodisp', '-autoexit', s))
-        if shutil.which('afplay'):  # MacOS
-            lst.append(lambda s: exec_command('afplay', s))
-        if shutil.which('aplay'):   # Linux ALSA
-            lst.append(lambda s: exec_command('aplay', '--quiet', s))
-    if path.is_file():
-        for callback in play_sound.backends:
-            return callback(str(path))
+    if not path.is_file() or not play_sound.backends[0]:
+        return
+    if isinstance(proc := play_sound.backends[0][0](path), subprocess.Popen):
+        last = getattr(play_sound, 'proc', None)
+        if last and last.poll() is None:
+            last.terminate()
+        play_sound.proc = proc
+
+
+def tree_mtime(root: str | Path, mtime: float = 0) -> float:
+    '''Recursively get the newest modified time under the tree'''
+    with suppress(OSError), os.scandir(root) as it:
+        for e in it:
+            if e.is_file(follow_symlinks=True):
+                mtime = max(mtime, e.stat().st_mtime)   # cached per entry
+            elif e.is_dir(follow_symlinks=False):       # avoid recursion
+                mtime = max(mtime, tree_mtime(e.path, e.stat().st_mtime))
+    return mtime
 
 
 def size_format(size: int) -> str:
-    '''Format size in bytes to human-readable string'''
+    '''Convert size in bytes to human-readable string'''
     for i in range(3, 0, -1):
         if size > 2**(i * 10):
             return f'{size / 2**(i * 10):.2f} {" KMG"[i]}B'
     return f'{size} B'
 
 
-def exec_result(*a, **k) -> str:
-    '''Execute command by subprocess and return its output'''
-    return subprocess.run(list(filter(map(str, a))), **{
-        'text': True, 'check': False, 'encoding': 'utf8', 'capture_output': True, **k
-    }).stdout
+def exec_command(*a, **k) -> subprocess.Popen:
+    '''Execute command and return the unstopped process'''
+    return subprocess.Popen([i for i in map(str, a)], **{
+        'text': True, 'encoding': 'utf8',
+        'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT, **k
+    })
 
 
-def exec_command(*a, bufsize: int = -1, **k) -> subprocess.Popen:
-    '''Execute command by subprocess and return the process'''
-    cmd = list(filter(map(str, a)))
-    if bufsize == 1:                                            # line buffer
-        if pty is not None:                                     # unix pty
-            mfd, sfd = pty.openpty()
-            proc = subprocess.Popen(cmd, **{
-                **k, 'stdout': sfd, 'stderr': subprocess.STDOUT, 'pass_fds': [sfd]
-            })
+def exec_result(*a, timeout: int | None = None, **k) -> str:
+    '''Execute command and wait and return its output'''
+    with exec_command(*a, **k) as proc:
+        try:
+            return proc.communicate(timeout=timeout)[0].strip()
+        except (KeyboardInterrupt, subprocess.TimeoutExpired):
+            return ''
+        finally:
+            proc.kill()
+
+
+def line_buffer(*cmd, check: bool = False, **k) -> typing.Iterator[str]:
+    '''Execute command and ensure stdout to be line buffered using PTY'''
+    tpl = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    k.setdefault('bufsize', 1)
+    if pty is not None:                                     # unix pty
+        mfd, sfd = pty.openpty()
+        with subprocess.Popen([i for i in map(str, cmd)], **{
+            **k, 'stdout': sfd, 'stderr': subprocess.STDOUT, 'pass_fds': [sfd]
+        }) as proc, os.fdopen(mfd, 'r', buffering=1, encoding='utf8') as fobj:
             os.close(sfd)
-            proc.stdout = fobj = os.fdopen(mfd, 'r', buffering=1, encoding='utf8')
-
-            def patch_eio(size: int = -1) -> str:
-                try:
-                    return fobj._tpl.sub('', fobj._readline(size))
-                except OSError as e:
-                    if e.errno == 5:    # EIO
-                        return ''       # EOF
-            fobj._tpl = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-            fobj._readline, fobj.readline = fobj.readline, patch_eio
-            return proc
-        if WINDOWS:                                             # winpty or conpty
+            try:
+                for line in fobj:
+                    if line := tpl.sub('', line.rstrip()):
+                        yield line
+            except OSError as e:
+                if e.errno != 5:  # EIO is treated as EOF
+                    raise
+    else:
+        if WINDOWS:                                         # winpty or conpty
             if git := shutil.which('git'):
                 winpty = abspath(f'{git}/../../usr/bin/winpty.exe')
             else:
                 winpty = Path(shutil.which('winpty') or '')
             if winpty.is_file():
-                cmd = [str(winpty), '-Xallow-non-tty'] + cmd
-        elif script := shutil.which('script'):                  # bsdutils
+                cmd = [winpty, '-Xallow-non-tty', *cmd]
+        elif script := shutil.which('script'):              # bsdutils
             cmd = [script, '-q', '-E', 'never', '-c', ' '.join(cmd), '/dev/null']
-        elif stdbuf := shutil.which('stdbuf'):                  # coreutils
-            cmd = [stdbuf, '-oL'] + cmd
-    return subprocess.Popen(cmd, **{
-        'text': True, 'bufsize': bufsize, 'encoding': 'utf8',
-        'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT, **k
-    })
+        elif stdbuf := shutil.which('stdbuf'):              # coreutils
+            cmd = [stdbuf, '-oL', *cmd]
+        with exec_command(*cmd, **k) as proc:
+            for line in proc.stdout:
+                if line := tpl.sub('', line.rstrip()):
+                    yield line
+    if (rc := proc.poll()) and check:
+        raise subprocess.CalledProcessError(rc, proc.args)
+
+
+def walk_filter(root: str | Path, incs: str = '', excs: str = '') -> typing.Iterator[Path]:
+    '''Glob files recursively and filter and yield Path'''
+    itpl = '|'.join(map(fnmatch.translate, filter(None, set(incs.split(';')))))
+    etpl = '|'.join(map(fnmatch.translate, filter(None, set(excs.split(';')))))
+    inc = re.compile(itpl, re.IGNORECASE).match if itpl else lambda n: True
+    exc = re.compile(etpl, re.IGNORECASE).match if etpl else lambda n: False
+    path = abspath(root)
+    if path.is_file():
+        if inc(path.name) and not exc(path.name):
+            yield path
+    elif path.is_dir():
+        def wrapper(r):
+            with suppress(OSError), os.scandir(r) as it:
+                for e in it:
+                    if e.is_file(follow_symlinks=False) and inc(e.name) and not exc(e.name):
+                        yield Path(e.path)
+                    elif e.is_dir(follow_symlinks=False) and not exc(e.name):
+                        yield from wrapper(e.path)
+        yield from wrapper(path)  # faster than os.walk because e.path is cached
+        #  for root, dirs, files in os.walk(path):
+        #      dirs[:] = [d for d in dirs if not exc(d)]
+        #      yield from (Path(root + '/' + fn) for fn in files if inc(fn) and not exc(fn))
+
+
+def cached_property(func: typing.Callable) -> functools.cached_property:
+    return functools.wraps(func)(functools.cached_property(func))
 
 
 class PZipFile(zipfile.ZipFile):
+    '''
+    Patching on zipfile.ZipFile and zipfile._ZipWriteFile to add support for
+    parallel compression and serial writing of pre-compressed data.
+    '''
     class EmptyCompressor:
         def compress(self, data: bytes) -> bytes: return data
         def flush(self) -> bytes: return b''
     _empty = EmptyCompressor()
 
     def writefile(self, zinfo: zipfile.ZipInfo, fin: str | Path | bytes | typing.BinaryIO) -> None:
-        '''Patch on zipfile._ZipWriteFile to write pre-compressed data'''
         comp = zipfile._get_compressor(zinfo.compress_type, zinfo._compresslevel) or self._empty
         data, crc, size, close = b'', 0, 0, False
         if isinstance(fin, (bytes, bytearray)):
@@ -574,26 +701,25 @@ class PZipFile(zipfile.ZipFile):
 class IOMixin:
     __excludes__ = ()
 
-    def asdict(self) -> dict:
-        return {k: v for k, v in dataclasses.asdict(self).items() if k not in self.__excludes__}
-
     @cached_property
-    def aliases(self) -> dict:
+    def __aliases__(self) -> dict:
         return {
-            field.metadata['alias']: name
-            for name, field in self.__dataclass_fields__.items()
+            field.metadata['alias']: field.name
+            for field in dataclasses.fields(self)
             if 'alias' in field.metadata
         }
 
     def __getattr__(self, key: str) -> typing.Any:
-        if key in self.aliases:
-            return getattr(self, self.aliases[key])
+        if key in self.__aliases__:
+            return getattr(self, self.__aliases__[key])
         raise AttributeError(f'Config has no attribute {key}')
 
     def __setattr__(self, key: str, val: typing.Any) -> None:
-        if key in self.aliases:
-            key = self.aliases[key]
-        if field := self.__dataclass_fields__.get(key):
+        if key in self.__aliases__:
+            key = self.__aliases__[key]
+        for field in dataclasses.fields(self):
+            if field.name != key:
+                continue
             if callable(field.type):
                 val = field.type(val)
             if 'ge' in field.metadata:
@@ -602,17 +728,25 @@ class IOMixin:
                 val = min(field.metadata['le'], val)
         super().__setattr__(key, val)
 
-    @classmethod
-    def load(cls, path: Path, ensure_exist: bool = False) -> typing.Self:
-        if ensure_exist and not path.is_file():
-            cls().dump(path)
-        return cls(**jload(path))
+    def asdict(self) -> dict:
+        return {k: v for k, v in dataclasses.asdict(self).items() if k not in self.__excludes__}
 
-    def dump(self, path: Path) -> Path: return jdump(self.asdict(), path)
+    def dump(self, path: Path) -> Path: return dump(self.asdict(), path)
+
+    @classmethod
+    def load(cls, path: Path) -> typing.Self:
+        fields = {f.name for f in dataclasses.fields(cls)}
+        data = {k: v for k, v in load(path).items() if k in fields}
+        if 'path' in fields:
+            data.setdefault('path', path)
+        return cls(**data)
 
 
 @dataclasses.dataclass
-class GameSnapConfig(IOMixin):
+class SnapConfig(IOMixin):
+    path: Path   = ''
+    __excludes__ = ('path')
+
     @staticmethod
     def _field(name: str, default: typing.Any = None, **k) -> dataclasses.Field:
         return dataclasses.field(default=default, metadata={'alias': name, **k})
@@ -623,6 +757,8 @@ class GameSnapConfig(IOMixin):
     schedule_seconds: int  = _field('sintv', 10 * 60, ge=1)
     http_server_port: int  = _field('port', 9999, le=65535)
     preview_filepath: str  = _field('pimg', '')
+    includes_pattern: str  = _field('incs', '')  # join patterns with colon `;`
+    excludes_pattern: str  = _field('excs', '')
     source_directory: Path = _field('sdir', BASEDIR)
     backup_directory: Path = _field('bdir', BASEDIR.parent / 'snapshots')
     backup_max_count: int  = _field('bcnt', 50, ge=1)
@@ -637,7 +773,15 @@ class GameSnapConfig(IOMixin):
 
 
 @dataclasses.dataclass
-class GameSnapRecord(IOMixin):
+class SnapRecord(IOMixin):
+    type: str
+    sdir: Path
+    hdir: Path
+    size: int                = 0
+    fcnt: int                = 0
+    name: str                = ''
+    time: float              = dataclasses.field(default_factory=time.time)
+    tree: dict[str, dict]    = dataclasses.field(repr=False, compare=False, default_factory=dict)
     '''
     Layout of tree:
     {
@@ -645,32 +789,20 @@ class GameSnapRecord(IOMixin):
             "subfolder": {
                 "file": ["hashval", rsize, mtime],
                 ...
-            }
+            },
             ...
         },
         ...
     }
-
-    Layout of flat:
-    {
-        "folder/subfolder/file": ["hashval", rsize, mtime],
-        ...
-    }
-
+    '''
+    info: dict[str, list]    = dataclasses.field(repr=False, compare=False, default_factory=dict)
+    '''
     Layout of info:
     {
         "folder/subfolder/file": [Path("/path/to/hashfile"), dsize, rsize, mtime],
         ...
     }
     '''
-    type: str
-    sdir: Path
-    hdir: Path
-    size: int                = 0
-    fcnt: int                = 0
-    time: float              = dataclasses.field(default_factory=time.time)
-    tree: dict[str, dict]    = dataclasses.field(repr=False, compare=False, default_factory=dict)
-    info: dict[str, list]    = dataclasses.field(repr=False, compare=False, default_factory=dict)
     view: Image.Image | None = dataclasses.field(repr=False, compare=False, default=None)
     path: Path               = ''
 
@@ -678,50 +810,60 @@ class GameSnapRecord(IOMixin):
 
     @cached_property
     def flat(self) -> dict[str, list]:
-        def dfs(root: dict, base: Path, cache: dict) -> dict:
+        '''
+        Layout of flat:
+        {
+            "folder/subfolder/file": ["hashval", rsize, mtime],
+            ...
+        }
+        '''
+        def dfs(root: dict, base: str, cache: dict) -> dict:
             for part, node in root.items():
-                path = base / part
+                path = base + ('/' if base else '') + part
                 if isinstance(node, dict):
                     dfs(node, path, cache)
                 else:
-                    cache[str(path)] = node
+                    cache[path] = node
             return cache
-        return dfs(self.tree, Path(''), {})
+        return dfs(self.tree, '', {})
 
-    def walk(
-        self,
-        on_dirs: typing.Callable[[Path, typing.Self, ...], None] | None = None,
-        on_dset: typing.Callable[[Path, typing.Self, ...], None] | None = None,
-        on_file: typing.Callable[[Path, typing.Self, ...], None] | None = None,
-        **k
-    ) -> None:
-        def dfs(root: dict, base: Path, cache: set) -> None:
+    @cached_property
+    def dirs(self) -> dict[str, list]:
+        '''
+        Layout of dirs:
+        {
+            "folder/subfolder": [nfile, tsize, mtime],
+            ...
+        }
+        '''
+        def dfs(root: dict, base: str, cache: dict) -> tuple[dict, int, float]:
+            nfile = tsize = mtime = 0
             for part, node in root.items():
-                path = base / part
+                path = base + ('/' if base else '') + part
                 if isinstance(node, dict):
-                    on_dirs and on_dirs(path, self, **k)
-                    dfs(node, path, cache)
+                    s, m = dfs(node, path, cache)[1:]
                 else:
-                    on_file and on_file(path, self, **k)
-                    if on_dset and base not in cache:
-                        on_dset(base, self, **k)
-                        cache.add(base)
-        dfs(self.tree, Path(''), set())
+                    s, m = node[1:]
+                    nfile += 1
+                tsize, mtime = tsize + s, max(mtime, m)
+            if base:
+                cache[base] = [nfile, tsize, mtime]
+            return cache, tsize, mtime
+        return dict(sorted(dfs(self.tree, '', {})[0].items()))
 
 
-class GameSnapEngine:
+class SnapEngine:
     '''Engine to create, restore, export, delete and summary snapshots'''
-
     @classmethod
     def create(
-        cls, cfg: GameSnapConfig, type: str = 'manual', pid: int | None = None,
+        cls, cfg: SnapConfig, type: str = 'manual', pid: int | None = None,
         log: typing.Callable[[Path, float], None] | None = None
     ) -> Path:
         '''
         Create a snapshot
 
         Args:
-            cfg (GameSnapConfig): provide sdir, bdir, comp, bcnt
+            cfg (SnapConfig): provide sdir, bdir, comp, bcnt
             type (str, optional): 'watch', 'sched', 'hotkey' or (default: 'manual')
             pid (int, optional): capture screenshot for specified process id
             log (Callable[[Path, float], None], optional): callback to log progress
@@ -730,12 +872,15 @@ class GameSnapEngine:
             Path: record path to the created snapshot
         '''
         view = capture(pid) if pid > 1 else None
-        snap = GameSnapRecord(type, cfg.sdir, cfg.bdir / 'blob')
+        snap = SnapRecord(type, cfg.sdir, cfg.bdir / 'blob')
         snap.hdir.mkdirp()
+        if view and log:
+            log(f'Captured {view.size} for {pid}', 0)
         files: dict[Path, tuple[str, int, int, int]] = {}
         infos: dict[str, tuple[Path, int, int, int]] = {
-            k: v for s in cls.summary(cfg.bdir, True, 'size') for k, v in s.info.items()
+            k: v for s in cls.summary(cfg.bdir, True, first='size') for k, v in s.info.items()
         }
+        log and log(f'Found {len(infos)} blob files', 0)
 
         def worker(src: Path) -> Path:
             rpath = src.relative_to(snap.sdir)
@@ -752,8 +897,7 @@ class GameSnapEngine:
                 dsize = stat.st_size
             else:
                 if src.is_symlink() or stat.st_nlink > 1:   # soft or hard link
-                    with tempfile.NamedTemporaryFile(delete=False) as f:
-                        tmp = f.name
+                    tmp = tempfile.NamedTemporaryFile(delete=False).name
                 else:
                     tmp = snap.hdir / str(stat.st_ino)
                 hobj = hashlib.md5()
@@ -769,7 +913,7 @@ class GameSnapEngine:
             files[rpath] = [dst.name, stat.st_size, stat.st_mtime, dsize]
             return rpath
 
-        paths = [x for x in itertools.chain(cfg.sdir.rglob('*'), [cfg.sdir]) if x.is_file()]
+        paths = list(walk_filter(cfg.sdir, cfg.incs, cfg.excs))
         snap.fcnt = len(paths)
         with poolmap(snap.fcnt) as pmap:
             for i, rpath in enumerate(pmap(worker, paths), 1):
@@ -782,8 +926,8 @@ class GameSnapEngine:
             snap.size += files[rpath][-1]
         path = snap.dump(cfg.bdir / strftime(snap.time, '%Y%m%d-%H%M%S-%f.zstd'))
         view and view.save(path.with_suffix('.jpg'))
-        for snap in cls.summary(cfg.bdir)[cfg.bcnt:]:
-            cls.delete(snap.path)
+        for s in cls.summary(cfg.bdir)[cfg.bcnt:]:
+            cls.delete(s.path)
         return path
 
     @classmethod
@@ -804,7 +948,7 @@ class GameSnapEngine:
         Returns:
             Path: record path
         '''
-        snap = GameSnapRecord.load(record)
+        snap = SnapRecord.load(record)
         sdir = sdir or snap.sdir
         srcs: list[Path] = []
         dsts: dict[Path, str] = {}
@@ -814,19 +958,15 @@ class GameSnapEngine:
                 continue
             srcs.append(snap.hdir / snap.flat[rel][0])
             dsts[sdir / rel] = rel
-        for path in sdir.rglob('*') if sync else []:
+        log and log(f'Found {len(dsts)} files to restore', 0)
+        for path in walk_filter(sdir) if sync else []:
             rel = str(path.relative_to(sdir))
-            if member and not rel.startswith(member):
-                continue
-            if path.is_file() and rel not in snap.flat:
+            if (not member or rel.startswith(member)) and rel not in snap.flat:
                 dels[path] = rel
-        if member:
-            def filtered_mkdir(rpath: Path, *a) -> None:
-                if str(rpath).startswith(member):
-                    (sdir / rpath).mkdirp()
-            snap.walk(on_dset=filtered_mkdir)
-        else:
-            snap.walk(on_dset=lambda rpath, *a: (sdir / rpath).mkdirp())
+        sync and log and log(f'Found {len(dels)} file to delete', 0)
+        for rel in snap.dirs:
+            if not member or rel.startswith(member):
+                (sdir / rel).mkdirp()
         total = len(dsts) + len(dels)
         with poolmap(total) as pmap:
             def worker(src: Path, dst: Path) -> Path:
@@ -860,7 +1000,7 @@ class GameSnapEngine:
         Returns:
             Path: absolute path to the exported zip file
         '''
-        snap = GameSnapRecord.load(record)
+        snap = SnapRecord.load(record)
         if not output.name:
             output /= record.stem
         output = output.with_suffix('.zip').touchp()
@@ -892,14 +1032,13 @@ class GameSnapEngine:
         Returns:
             Path: record path
         '''
-        hdir = GameSnapRecord.load(record).hdir
+        hdir = SnapRecord.load(record).hdir
         snaps = cls.summary(record.parent)
         if hdir.parent != record.parent:
             snaps += cls.summary(hdir.parent)
-        used, dels = {v[0] for s in snaps if s.path != record for v in s.flat.values()}, {}
-        for path in hdir.iterdir():
-            if path.is_file() and path.name not in used:
-                dels[path] = path.relative_to(hdir)
+        log and log(f'Found {len(snaps)} snapshots', 0)
+        used = {v[0] for s in snaps if s.path != record for v in s.flat.values()}
+        dels = {p: p.relative_to(hdir) for p in walk_filter(hdir) if p.name not in used}
         total = len(dels)
         with poolmap(total) as pmap:
             for i, path in enumerate(pmap(lambda x: x.unlink() or x, dels), 1):
@@ -909,66 +1048,70 @@ class GameSnapEngine:
         return record
 
     @classmethod
-    def summary(cls, bdir: Path, detail: bool = False, first: str = '') -> list[GameSnapRecord]:
+    def summary(cls, bdir: Path, detail: bool = False, first: str = '') -> list[SnapRecord]:
         '''
         List all snapshots with newest first
 
         Args:
-            bdir (Path): GameSnapConfig.backup_directory
+            bdir (Path): SnapConfig.backup_directory
             detail (bool, optional): include detail information (default: False)
-            first (str, optional): only report the first one sorted by 'ctime', 'size' or 'name'
+            first (str, optional): only report the first one sorted by 'mtime', 'size' or 'name'
 
         Returns:
-            list[GameSnapRecord]
+            list[SnapRecord]
         '''
         if not bdir.is_dir():
             return {}
         if not hasattr(cls, '_cache'):
             cls._cache = {}
-        paths = {p: 0 for p in bdir.iterdir() if p.suffix in {'.json', '.zstd'}}
-        cache = cls._cache.setdefault((str(bdir), bool(detail), str(first)), {})
-        hasher = hashlib.md5(f'{bdir.stat().st_mtime}'.encode())
+        cache = cls._cache.setdefault((str(bdir), bool(detail), str(first)), {'hash': 0})
+        paths = {
+            Path(e.path): [e.stat().st_mtime, e.stat().st_size, e.name]
+            for e in sorted(os.scandir(bdir), key=lambda e: e.name)
+            if e.is_file() and e.name.endswith(('.json', '.zstd'))
+        }
+        oldval, cache['hash'] = cache['hash'], hash(f'{bdir.stat().st_mtime}{paths.values()}')
+        if oldval == cache['hash']:
+            return cache['data']
+        if first:
+            col = {'mtime': 0, 'size': 1, 'name': 2}.get(first, 0)
+            paths = sorted(paths, key=lambda x: paths[x][col], reverse=True)
+        snaps: list[SnapRecord] = []
         for path in paths:
-            stat = path.stat()
-            paths[path] = [stat.st_ctime, stat.st_size, path.name]
-            hasher.update(f'{path}{stat.st_mtime}|{stat.st_size}'.encode())
-        hval, cache['hash'] = cache.get('hash', ''), hasher.hexdigest()
-        if hval != cache['hash']:
-            if first:
-                col = {'ctime': 0, 'size': 1, 'name': 2}.get(first, 0)
-                paths = sorted(paths, key=lambda x: paths[x][col], reverse=True)
-            snaps = []
-            for path in paths:
-                if first and len(snaps) == 1:
-                    break
-                try:
-                    snap = GameSnapRecord.load(path)
-                    snap.path = path
-                    snaps.append(snap)
-                    assert detail
-                except Exception:
+            try:
+                assert not first or len(snaps) != 1
+                snaps.append(snap := SnapRecord.load(path))
+                assert detail
+            except Exception:
+                continue
+            stats = cls._cache.setdefault(snap.hdir, {'time': 0})
+            newval, oldval = snap.hdir.stat().st_mtime, stats['time']
+            if oldval != newval:
+                stats['size'] = {e.name: e.stat().st_size for e in os.scandir(snap.hdir)}
+                stats['time'] = newval
+            view = path.with_suffix('.jpg')
+            if view.is_file():
+                snap.view = Image.open(view).copy()
+            for rel, (hval, rsize, mtime) in snap.flat.items():
+                dst = snap.hdir / hval
+                if hval in stats['size']:
+                    snap.info[rel] = [dst, stats['size'][hval], rsize, mtime]
                     continue
-                view = path.with_suffix('.jpg')
-                if view.is_file():
-                    snap.view = Image.open(view).copy()
-                for rel, (hval, rsize, mtime) in snap.flat.items():
-                    dst = snap.hdir / hval
-                    try:
-                        for prev in snaps[-2::-1]:
-                            if rel in prev.info and any(prev.info[rel][1:]):
-                                snap.info[rel] = prev.info[rel]
-                                break
-                        else:
-                            stat = dst.stat()
-                            assert stat.st_mtime == mtime
-                            snap.info[rel] = [dst, stat.st_size, rsize, mtime]
-                    except Exception:
-                        snap.info[rel] = [dst, 0, 0, 0]
-            cache['data'] = sorted(snaps, key=lambda x: x.time, reverse=True)
+                for prev in snaps[-2::-1]:
+                    if rel in prev.info and any(prev.info[rel][1:]):
+                        snap.info[rel] = prev.info[rel]
+                        break
+                else:
+                    snap.info[rel] = [dst, 0, 0, 0]
+                    with suppress(Exception):
+                        stat = dst.stat()
+                        assert stat.st_mtime == mtime
+                        snap.info[rel] = [dst, stat.st_size, rsize, mtime]
+        cache['data'] = sorted(snaps, key=lambda x: x.time, reverse=True)
         return cache['data']
 
 
-class GameSnapRouter(BaseHTTPRequestHandler):
+class SnapRouter(http.server.BaseHTTPRequestHandler):
     '''Simple router to register callback functions and handle http requests'''
     route: dict[str, dict[str, typing.Any]] = {}
 
@@ -978,8 +1121,8 @@ class GameSnapRouter(BaseHTTPRequestHandler):
     @classmethod
     def from_port(
         cls, port: int, host: str = 'localhost'
-    ) -> tuple[threading.Thread, ThreadingHTTPServer]:
-        srv = ThreadingHTTPServer((host, port), cls)
+    ) -> tuple[threading.Thread, http.server.ThreadingHTTPServer]:
+        srv = http.server.ThreadingHTTPServer((host, port), cls)
         return threading.Thread(target=srv.serve_forever, name='httpd', daemon=True), srv
 
     @classmethod
@@ -1081,7 +1224,7 @@ class GameSnapRouter(BaseHTTPRequestHandler):
             self.send_json({'error': f'Request failed: {e}'}, 500)
 
 
-class GameSnapBroker(object):
+class SnapBroker(object):
     '''Manage config, engine, router and subtasks (watchdog, scheduler etc.)'''
 
     def __init__(self, cfg: str | Path | None = None, srv: bool = True, verbose: int = 0) -> None:
@@ -1094,18 +1237,18 @@ class GameSnapBroker(object):
         self._sched = [None, threading.Event(), threading.Event()]
         self._psync = [None, threading.Event()]
         self._httpd = [None, None]
-        self.engine = GameSnapEngine()
-        self.config = GameSnapConfig()
+        self.engine = SnapEngine()
+        self.config = SnapConfig()
         self.update(self.config if cfg is None else cfg)
-        for attr, func in vars(self.__class__).items():
-            if not attr.startswith(('_', 'on_')) and callable(func):
-                GameSnapRouter.register(func)
+        for attr, func in inspect.getmembers(self.__class__, callable):
+            if not attr.startswith(('_', 'on_')):
+                SnapRouter.register(func)
 
     __getitem__ = __getattr__ = lambda self, key: getattr(self.config, key)
 
     def __setitem__(self, key: str, val: typing.Any) -> None:
-        if key in self.config.aliases:
-            key = self.config.aliases[key]
+        if key in self.config.__aliases__:
+            key = self.config.__aliases__[key]
         if not hasattr(self.config, key):
             return
         if hasattr(self, f'_set_{key}'):
@@ -1126,15 +1269,28 @@ class GameSnapBroker(object):
             k.setdefault('log', cprint)
         try:
             yield k
+            if self.config.succ and not self._nosrv:
+                play_sound(self.config.succ)
         except Exception:
             if self.config.fail and not self._nosrv:
                 play_sound(self.config.fail)
             raise
         finally:
-            if self.config.succ and not self._nosrv:
-                play_sound(self.config.succ)
             if newline:
                 print('')
+
+    @property
+    def srvs(self) -> dict:
+        '''State of background services'''
+        return {
+            'watch': self._watch.is_alive(),
+            'sched': self._sched[0] and self._sched[0].is_alive(),
+            'httpd': self._httpd[0] and self._httpd[0].is_alive(),
+            'psync': self._psync[0] and self._psync[0].is_alive(),
+            'hotkey': any(set(getattr(keyboard, '_hotkey', {})) & {
+                self.config.knew, self.config.ktog, self.config.kdel
+            }),
+        }
 
     def preset(self, path: Path, name: str = '') -> dict:
         '''
@@ -1148,9 +1304,9 @@ class GameSnapBroker(object):
             dict: parsed presets
 
         Examples:
-            >>> broker = GameSnapBroker()
-            >>> broker.preset('D:/EZAB/GAMELIST.ERAB')
-            {'games': {                             # example
+            >>> broker = SnapBroker()
+            >>> broker.preset('D:/EZAB/GAMELIST.ERAB')['games']
+            {                                       # example
                 <Game name>: [                      # 'Project Zomboid'
                     <Save file basename>,           # 'Map'
                     <Save file extension>,          # '.bin'
@@ -1161,13 +1317,13 @@ class GameSnapBroker(object):
                     <Only backup single file>,      # 1: Map*.bin, 0: Map.bin
                 ],
                 ...
-            }}
-            >>> broker.preset('D:/EZAB/GAMELIST.ERAB', name='Project Zomboid')
+            }
+            >>> broker.preset('D:/EZAB/GAMELIST.ERAB', name='Project Zomboid')['result']
             Using sdir=~/Zomboid and proc=ProjectZomboid64.exe
         '''
-        data = {'games': {}}
-        info = ConfigParser(default_section='Info')
-        with open(abspath(path), encoding='utf8') as f:
+        data = {'games': {}, 'extra': {}, 'result': ''}
+        info = configparser.ConfigParser(default_section='Info')
+        with suppress(OSError), open(abspath(path), encoding='utf8') as f:
             for row in csv.reader(f, delimiter='#'):
                 if not row:
                     continue
@@ -1176,8 +1332,10 @@ class GameSnapBroker(object):
                 data['games'][row[0]] = row[1:]
             info.read_string(f.read())
         for sname, section in info.items():
-            data.setdefault(sname.lower(), {}).update(section.items())
-        if name in data['games']:
+            data['extra'].setdefault(sname.lower(), {}).update(section.items())
+        if name not in data['games']:
+            data['result'] = f'{name} not found'
+        else:
             sdir = abspath(re.sub(r'<(\w+)>', lambda m: {
                 'id': '*',
                 'steam': where('Valve\\Steam', 'InstallPath', '~/.steam'),
@@ -1198,49 +1356,64 @@ class GameSnapBroker(object):
                         self.config.sdir = base
                     self.config.proc = data['games'][name][2]
                 break
-            if self._level:
-                logger.info(f'Using sdir={self.config.sdir} and proc={self.config.proc}')
+            data['result'] = f'Using sdir={self.config.sdir} and proc={self.config.proc}'
         return data
 
-    def update(self, cfg: str | dict | Path | None = None, **k) -> dict[str, typing.Any]:
+    def update(self, cfg: dict | str | Path | None = None, **k) -> dict[str, typing.Any]:
         '''
         Update configuration from file or string
 
         Args:
-            cfg (str | dict | Path, optional): absolute path to config file or JSON string
+            cfg (dict | str | Path, optional): config data or config file or JSON string
+
+        Notes:
+            If cfg is an absolute path, replace current config with the one from file.
+            If str, make sure it exists. If pathlib.Path, this function ensure file exists.
 
         Returns:
             dict: current configuration
 
         Examples:
-            >>> broker = GameSnapBroker()
-            >>> broker.update(None)                     # get current config
+            >>> broker = SnapBroker()
+            >>> broker.config.path                                  # config in memory
+            ''
+            >>> broker.update(None)                                 # get current config
             {'http_server_port': 9999, 'backup_max_count': 20, ...}
-            >>> broker.update({'port': 0, 'bcnt': 0})   # support alias
+            >>> broker.update({'port': 0, 'bcnt': 0})               # support aliases
             {'http_server_port': 0, 'backup_max_count': 0, ...}
-            >>> broker.update('{"http_server_port": 8888}')
+            >>> broker.update('{"http_server_port": 8888}')         # from JSON string
             {'http_server_port': 8888, 'backup_max_count': 10, ...}
-            >>> broker.update('/absolute/path/to/config.json')
+            >>> broker.update('/absolute/path/to/config.json')      # from file
             {'http_server_port': 9999, 'backup_max_count': 10, ...}
+            >>> broker.config.path                                  # path changed
+            Path('/absolute/path/to/config.json')
         '''
-        data = {}
+        target = self.config
+        data = cfg if isinstance(cfg, dict) else {}
         if isinstance(cfg, str):
-            if '{' in cfg:
+            if '{' in cfg or ':' in cfg:
                 data = json_repair.loads(cfg) if json_repair else json.loads(cfg)
-            elif Path(cfg).is_absolute():
-                data = jload(cfg)
-        elif isinstance(cfg, dict):
-            data = cfg
-        elif isinstance(cfg, _Path):
-            data = dataclasses.asdict(GameSnapConfig.load(cfg, ensure_exist=True))
+            elif (path := abspath(cfg)).is_file():
+                target = SnapConfig.load(path)
+                data = target.asdict()
+        elif isinstance(cfg, pathlib.Path):
+            if not cfg.is_file():
+                SnapConfig().dump(cfg)
+            target = SnapConfig.load(cfg)
+            data = target.asdict()
         with self._mutex:
+            if target.path != self.config.path:
+                self.start = 0
+                self._snaps[-1] = {}
+                self.config.path.name and self.config.dump(self.config.path)
+                self.config.path = target.path
             for key, val in data.items():
                 self[key] = val
-        return dataclasses.asdict(self.config)
+        return self.config.asdict()
 
     def create(self, type: str = 'manual', **k) -> Path:
         '''
-        Create a new snapshot with current GameSnapConfig
+        Create a new snapshot with current SnapConfig
 
         Args:
             type (str, optional): 'watch', 'sched', 'hotkey' or default 'manual'
@@ -1266,7 +1439,7 @@ class GameSnapBroker(object):
             Path: record path
 
         Examples:
-            >>> broker = GameSnapBroker()
+            >>> broker = SnapBroker()
             >>> record = random.choice(broker.summary())
             >>> broker.restore(record.path)
             Path('/absolute/path/to/<record.path>')
@@ -1291,19 +1464,21 @@ class GameSnapBroker(object):
             Path: absolute path to the exported zip file
 
         Examples:
-            >>> broker = GameSnapBroker()
+            >>> broker = SnapBroker()
             >>> record = random.choice(broker.summary())
             >>> broker.export(record.path, '~/save')
             Path('C:/Users/<username>/save.zip')
             >>> broker.export(record.path, 'D:/')
             Path('D:/<record>.zip')
+            >>> broker.export(record.path, 'D:/test.rar')
+            Path('D:/test.zip')
         '''
         with self._mutex, self._inject(k):
             return self.engine.export(abspath(record), abspath(output), **k)
 
     def delete(self, record: Path, **k) -> Path:
         '''
-        Delete a snapshot with current GameSnapConfig
+        Delete a snapshot with current SnapConfig
 
         Args:
             record (Path): record path
@@ -1312,7 +1487,7 @@ class GameSnapBroker(object):
             Path: record path
 
         Examples:
-            >>> broker = GameSnapBroker()
+            >>> broker = SnapBroker()
             >>> broker.delete(random.choice(broker.summary()).path)
         '''
         with self._mutex, self._inject(k):
@@ -1332,20 +1507,20 @@ class GameSnapBroker(object):
         '''Delete all snapshots in backup directory'''
         return [self.delete(snap.path, **k) for snap in self.summary(False)]
 
-    def summary(self, detail: bool = True) -> list[GameSnapRecord]:
+    def summary(self, detail: bool = True) -> list[SnapRecord]:
         '''
-        Get summary of all snapshots with current GameSnapConfig
+        Get summary of all snapshots with current SnapConfig
 
         Args:
             detail (bool, optional): include detail information (default: True)
 
         Returns:
-            list[GameSnapRecord]
+            list[SnapRecord]
 
         Examples:
-            >>> broker = GameSnapBroker()
-            >>> broker.summary(detail=False)[0].info
-            {}
+            >>> broker = SnapBroker()
+            >>> broker.summary(detail=False)
+            [SnapRecord(type=xxx, sdir=xxx, hdir=xxx, ..., info={}), ...]
             >>> broker.summary(detail=True)[0].info
             {<relpath>: [<fullpath>, <size>, <mtime>], ...}
         '''
@@ -1354,17 +1529,17 @@ class GameSnapBroker(object):
 
     def toggle_mode(self, sync: bool = False, start: int | bool | None = None) -> int | bool:
         '''
-        Switch between manual and sync mode, then start/stop the service
+        Switch between tri-state: manual start | manual stop | auto sync
 
         Args:
             sync (bool, optional): switch to sync mode (default: False)
             start (int | bool | None, optional): start/stop the service (default: None)
 
         Returns:
-            int | bool: current mode
+            int | bool: current mode, int for sync, bool for manual
 
         Examples:
-            >>> broker = GameSnapBroker()
+            >>> broker = SnapBroker()
             >>> proc = subprocess.Popen(broker.syncwith_process)
             >>> broker.start
             <proc.pid>                          # sync mode (process running)
@@ -1380,7 +1555,7 @@ class GameSnapBroker(object):
         '''
         with self._mutex:
             if sync:
-                self.start = int(self.start)            # sync with process
+                self.start = pidof(self.config.proc)    # sync with process
             elif isinstance(start, (int, bool)):
                 self.start = start
             elif isinstance(self.start, int):
@@ -1397,17 +1572,8 @@ class GameSnapBroker(object):
     start = property(lambda s: s._start, _set_start)
     snaps = property(lambda s: s._snaps[3])
 
-    @property
-    def srvs(self) -> dict:
-        return {
-            'watch': self._watch.is_alive(),
-            'sched': self._sched[0] and self._sched[0].is_alive(),
-            'httpd': self._httpd[0] and self._httpd[0].is_alive(),
-            'psync': self._psync[0] and self._psync[0].is_alive(),
-            'hotkey': any([self.config.knew, self.config.ktog, self.config.kdel]),
-        }
-
     def on_snaps(self, callback: typing.Callable[[], None] | bool, intv: int = 3) -> None:
+        '''SnapBroker.summary(True) is slow for UI so run it in a thread and cache the result'''
         if callback is True:
             return self._snaps[2].set()
         self._snaps[1].set()
@@ -1418,10 +1584,11 @@ class GameSnapBroker(object):
 
         def loop() -> None:
             while not self._snaps[1].is_set():
-                snaps, self._snaps[3] = self.snaps, {str(x.path): x for x in self.summary()}
+                snaps, self._snaps[3] = self.snaps, {str(x.path): x for x in self.summary(True)}
                 if list(snaps) != list(self.snaps):
                     callback()
                 self._snaps[2].wait(intv)
+                self._snaps[2].clear()
         self._snaps[0] = threading.Thread(target=loop, name='summary', daemon=True)
         self._snaps[0].start()
 
@@ -1474,11 +1641,11 @@ class GameSnapBroker(object):
             self._httpd[1].server_close()
             self._httpd[0].join(1)
         if self.config.port and not alive and not self._nosrv:
-            self._httpd = GameSnapRouter.from_port(self.config.port)
+            self._httpd = SnapRouter.from_port(self.config.port)
             self._httpd[0].start()
 
     def _set_syncwith_process(self, v: str) -> None:
-        self.config.proc = (v or '').lower()
+        self.config.proc = (v or '').lower().replace('.exe', '')
         if not self.config.proc or self._nosrv:
             self._psync[1].set()
             return self._psync[0] and self._psync[0].join()
@@ -1486,9 +1653,9 @@ class GameSnapBroker(object):
             return
         self._psync[1].clear()
 
-        def loop(intv: int = 1) -> None:
+        def loop(intv: int = 3) -> None:
             while not self._psync[1].wait(intv):
-                if isinstance(self.start, int):
+                if not isinstance(self.start, bool):
                     self.start = pidof(self.config.proc)
         self._psync[0] = threading.Thread(target=loop, name='syncwith-process', daemon=True)
         self._psync[0].start()
@@ -1539,7 +1706,7 @@ class GameSnapBroker(object):
     _set_hotkey_of_toggle = _hotkey_factory('ktog', lambda s: s.toggle_mode(start=not s.start))
     _set_hotkey_of_delete = _hotkey_factory('kdel', lambda s: s.delete_latest())
 
-    def record_hotkey(
+    def on_hotkey(
         self, name: typing.Literal['knew', 'ktog', 'kdel'],
         tout: int = 5, log: typing.Callable[str, None] | None = None
     ) -> str:
@@ -1555,11 +1722,11 @@ class GameSnapBroker(object):
             str: new hotkey
 
         Notes:
-            1. All keys will be captured and suppressed for further propagation
-            2. If no keys pressed until timeout then return '' (cleared)
-            3. Press `esc` to cancel recording and return previous value
+            1. All keys will be captured and suppressed during recording
+            2. Press `esc` to cancel recording and return previous value
+            3. If no keys pressed until timeout then return '' (cleared)
         '''
-        old, self[name] = self[name], ''                    # disable hotkey
+        old, self[name] = self[name], ''                    # disable current hotkey
         buf, que = {}, queue.Queue()
         stop = keyboard.hook(que.put, suppress=True)        # start record
         try:
@@ -1599,7 +1766,7 @@ class UIMixin:
             'snaps': 'Snapshots', 'type': 'Type', 'start': 'Start', 'stop': 'Stop',
             'files': 'Files', 'size': 'File Size', 'mtime': 'Last Modified',
             'create': 'Create', 'restore': 'Restore', 'export': 'Export', 'delete': 'Delete',
-            'on': 'On', 'off': 'Off', 'yes': 'Yes', 'no': 'No',
+            'rename': 'Rename', 'on': 'On', 'off': 'Off', 'yes': 'Yes', 'no': 'No',
         },
         'zh': {
             'zh': '中文', 'lang': '语言', 'ready': '就绪', 'error': '错误',
@@ -1613,21 +1780,21 @@ class UIMixin:
             'snaps': '个备份', 'type': '类型', 'start': '开始', 'stop': '停止',
             'files': '个文件', 'size': '文件大小', 'mtime': '修改时间',
             'create': '新建', 'restore': '恢复', 'export': '导出', 'delete': '删除',
-            'on': '已启用', 'off': '已关闭', 'yes': '是', 'no': '否',
+            'rename': '重命名', 'on': '已启用', 'off': '已关闭', 'yes': '是', 'no': '否',
         }
     }
 
-    def __init__(self, brok: GameSnapBroker | None = None, langdir: Path = BASEDIR, **k) -> None:
-        self.brok = brok or GameSnapBroker(CFGFILE, **k)
+    def __init__(self, brok: SnapBroker | None = None, langdir: Path = BASEDIR, **k) -> None:
+        self.brok = brok or SnapBroker(CFGFILE, **k)
         for path in langdir.glob('lang-*.json'):
-            if data := jload(path):
+            if data := load(path):
                 self.langs[path.stem[5:]] = data
 
     def __call__(self, k: str) -> str:
         return self.langs[self.brok.lang].get(k, self.langs['en'].get(k, k))
 
 
-class AskMixin:
+class TUIMixin:
     class AskYesNo(textual.screen.ModalScreen[bool]):
         CSS = '''AskYesNo Static { min-width: 50vw; }'''
 
@@ -1737,8 +1904,57 @@ class AskMixin:
         def on_directory_tree_file_selected(self, evt: ttw.DirectoryTree.FileSelected) -> None:
             self.path = evt.path
 
+    class Tree(ttw.Tree):
+        ICON_NODE_EXPANDED = '📂 '
+        ICON_NODE = '📁 '
+        ICON_FILE = '📄 '
+        WIDE_CHAR = re.compile(r'''     # two column charactors
+            [\u1100-\u115F] |           # Hangul Jamo
+            [\u2E80-\u9FFF] |           # CJK
+            [\uA960-\uA97F] |           # Korean Extend-A
+            [\uAC00-\uD7AF] |           # Hangul Syllables
+            [\uF900-\uFAFF] |           # CJK compatible
+            [\uFF00-\uFFEF]             # Alnum + Symbol
+        ''')
+        SIZE_WIDTH = 9                  # xxx.xx xx
+        TIME_WIDTH = 19                 # xxxx-xx-xx xx:xx:xx
+        guide_depth = 3
+        auto_expand = False
 
-class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
+        def get_indent(self, node) -> int:
+            depth = 0
+            while node := node.parent:
+                depth += 1
+            return depth * self.guide_depth
+
+        def get_length(self, label) -> int:
+            return len(label) + len(self.WIDE_CHAR.findall(str(label)))
+
+        def render_label(self, node, base, style):
+            label = node.label.copy()
+            label.stylize(style)
+            label = label.assemble((
+                self.ICON_NODE_EXPANDED if node.is_expanded else self.ICON_NODE,
+                base + ttw._tree.TOGGLE_STYLE
+            ) if node.allow_expand else (self.ICON_FILE, base), label)
+            with suppress(AttributeError, TypeError, AssertionError):
+                sstr, tstr = node.data[1:]
+                width = self.size.width
+                indent = self.get_indent(node)
+                namelen = width - indent - self.SIZE_WIDTH - self.TIME_WIDTH - 4
+                assert namelen > 10
+                textlen = self.get_length(label)
+                if textlen > namelen:
+                    label = label[:namelen - 3] + '...'
+                elif textlen < namelen:
+                    label.pad_right(namelen - textlen)
+                label += f' {sstr:>{self.SIZE_WIDTH}}'
+                label += f' {tstr:>{self.TIME_WIDTH}}'
+            return label
+
+
+class SnapTUI(textual.app.App, UIMixin, TUIMixin):
+    '''Terminal UI by textual'''
     CSS = '''
         Screen {
             layout: grid;
@@ -1891,10 +2107,8 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         with ttc.Vertical(id='list', classes='border row2'):
             with ttw.Static(id='pimg') as pimg:
                 pimg.data = {'path': None, 'image': None, 'pixels': None}
-            with ttw.Tree('', data=('', 0, 0), id='tree') as tree:
-                tree.ICON_NODE_EXPANDED = '📂 '
-                tree.ICON_NODE = '📁 '
-                tree.ICON_FILE = '📄 '
+            with self.Tree('', data=('', '', ''), id='tree') as tree:
+                tree.dirs: dict[str, type(tree.root)] = {}
             yield ttc.Horizontal(
                 ttw.Button(self('restore'), id='restore'),
                 ttw.Button(self('export'), id='export'),
@@ -1921,7 +2135,7 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
 
     def slog(self, *a, **k) -> None:
         '''display message on RichLog'''
-        self['#slog'].write(' '.join([strftime('[%X]'), *map(str, a)]), **k)
+        self['#slog'].write(' '.join([strftime(fmt='[%X]'), *map(str, a)]), **k)
 
     def set_state(self, w: str | textual.widget.Widget, enable: typing.Any) -> bool:
         '''enable or disable a widget'''
@@ -1936,13 +2150,13 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         if force:
             table.clear()
         old, new = [rkey.value for rkey in table.rows], list(self.brok.snaps)
-        for pstr in [p for p in old if p not in new]:
+        for pstr in (p for p in old if p not in new):
             table.remove_row(pstr)
-        for pstr in [p for p in new if p not in old]:
+        for pstr in (p for p in new if p not in old):
             snap = self.brok.snaps[pstr]
             size = size_format(snap.size)
             stype = self(snap.type)
-            table.add_row(snap.path.name, stype, size, key=pstr)
+            table.add_row(snap.name or snap.path.name, stype, size, key=pstr)
         header = table.columns[table.name_col]
         if self.brok.snaps:
             header.label = f'{len(self.brok.snaps)}/{self.brok.bcnt} {self("snaps")}'
@@ -1953,10 +2167,10 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         '''update process name and button style after optional toggle'''
         if auto is not None:
             self.brok.toggle_mode(auto)
-        if isinstance(self.brok.start, int) and self.brok.proc:
-            t, b, p = self('manual'), 'success' if self.brok.start else 'warning', 'foreground'
-        else:
+        if isinstance(self.brok.start, bool) or not self.brok.proc:
             t, b, p = self('stop' if self.brok.start else 'start'), 'primary', 'warning'
+        else:
+            t, b, p = self('manual'), 'success' if self.brok.start else 'warning', 'foreground'
         self['#toggle'].label = t
         self['#toggle'].variant = b
         self['#proc'].styles.color = self['#lproc'].styles.color = getattr(self.current_theme, p)
@@ -2004,7 +2218,8 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         self.brok.on_snaps(self.sync_snaplist)
         self.slog(self('ready'))
 
-    def on_unmount(self) -> None: self.brok.dump(CFGFILE)
+    def on_unmount(self) -> None:
+        self.brok.config.path.name and self.brok.config.dump(self.brok.config.path)
 
     def on_key(self, evt: tte.Key) -> None:
         wid = getattr(self.focused, 'id', None)
@@ -2021,6 +2236,7 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         elif wid == 'tree' and evt.key == 'escape':
             self.select[1] = ''
             self.focused.unselect()
+            self.on_preview()
         elif wid == 'proc' and evt.key == 'enter':
             self.sync_process(True)
         elif wid == 'slog' and evt.character in ['+', '=', '-', '_']:
@@ -2082,7 +2298,7 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
 
     # @textual.on(tte.Resize)
     def on_preview(self, e: tte.Resize | Image.Image | Path | bool = False) -> None:
-        '''preview image of snapshot specified by GameSnapConfig.preview_filepath'''
+        '''preview image of snapshot specified by SnapConfig.preview_filepath'''
         if not RichPixels:
             return
         pimg = self['#pimg']
@@ -2093,7 +2309,7 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
             if data['image'] == e and data['pixels']:
                 return pimg.update(data['pixels'])
             data.update({'path': None, 'image': e})
-        elif isinstance(e, _Path):                          # show thumbnail
+        elif isinstance(e, Path):                           # show thumbnail
             if data['path'] == e and data['pixels']:
                 return pimg.update(data['pixels'])
             if e.suffix == '.zstd':
@@ -2105,7 +2321,7 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
             data['path'] = data['image'] = data['pixels'] = None
             return pimg.update('')
         opts = self['#opts'].size.height * 2
-        size = (max(1, self['#tree'].size.width), max(1, opts, self['#list'].size.height))
+        size = (max(1, self['#tree'].size.width), max(1, min(opts, self['#list'].size.height)))
         if size != data['image'].size:                      # resize widget
             tmp = data['image'].copy()
             tmp.thumbnail(size, Image.Resampling.LANCZOS)
@@ -2124,7 +2340,8 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         path = task(*a, **k, log=lambda p, c: self['#pbar'].update(progress=c))
         self['#pbar'].add_class('hide')
         self['#slog'].remove_class('hide')
-        self.slog(f'{self(wid)}: {path} ({time.perf_counter() - ts:.2f}s)')
+        dt = time.perf_counter() - ts
+        self.slog(f'{self(wid)}: {path} ({dt:.2f}s)')
         self.set_state('#' + wid, True)
         self.brok.on_snaps(True)
         self.sync_buttons()
@@ -2155,14 +2372,18 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
             if await self.push_screen_wait(self.AskYesNo(self('delete') + '?', self.select[0])):
                 self.on_service(evt.button.id, self.brok.delete, Path(self.select[0]))
 
-    def on_data_table_row_selected(self, evt: ttw.DataTable.RowSelected) -> None:
-        path = getattr(evt.row_key, 'value', '')
-        if self.select[0] != path:
-            self.select[0] = path
-        else:
+    @textual.on(ttw.DataTable.RowSelected)
+    @textual.on(ttw.DataTable.RowHighlighted)
+    def on_select(self, evt: textual.message.Message) -> None:
+        if self.screen != self.default_screen:
             return
+        path = getattr(evt.row_key, 'value', '')
+        if self.select[0] == path:
+            return
+        self.select[0] = path
         tree = self['#list #tree']
         snap = self.brok.snaps.get(self.select[0])
+        item = self.select[1]
         tree.clear()
         tree.root.collapse()
         self.sync_buttons()
@@ -2170,34 +2391,37 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
         if not snap:
             tree.root.label = self.select[1] = ''
             return
-        dirs: dict[Path, type(tree.root)] = {Path('.'): tree.root}
+        tree.dirs.clear()
+        parents = {str(p) for p in Path(item).parents[:-1]} if item else set()
+        for rel, (nfile, tsize, mtime) in snap.dirs.items():
+            head, tail = os.path.split(rel)
+            tree.dirs[rel] = tree.dirs.get(head, tree.root).add(tail, data=(
+                rel, size_format(tsize), mtime and strftime(mtime) or ''
+            ), expand=rel in parents)
+        self.on_tree_node_expanded(parents)
+        tree.root.label = f'{snap.fcnt} {self("files")}'
+        self.select[1] = item if item in snap.flat else ''
 
-        def add_node(r: Path, s: GameSnapRecord) -> None:
-            dirs[r] = dirs.get(r.parent, tree.root).add(r.name, data=(str(r), 0, 0))
-
-        def add_leaf(r: Path, s: GameSnapRecord) -> None:
-            rel = str(r)
-            path, dsize, rsize, mtime = s.info[rel]
-            leaf = dirs.get(r.parent, tree.root).add_leaf(tree.ICON_FILE + r.name, data=(
-                rel, size_format(dsize), mtime and strftime(mtime) or ''
-            ))
+    def on_tree_node_expanded(self, evt: ttw.Tree.NodeExpanded | set[str]) -> None:
+        snap = self.brok.snaps[self.select[0]]
+        tree = self['#list #tree']
+        parents = evt if isinstance(evt, set) else {evt.node.data[0]}
+        for rel in snap.flat:
+            head, tail = os.path.split(rel)
+            if head not in parents:
+                continue
+            path, dsize, rsize, mtime = snap.info[rel]
+            dsize, mtime = size_format(dsize), mtime and strftime(mtime) or ''
+            node = tree.dirs.get(head, tree.root).add_leaf(tail, data=(rel, dsize, mtime))
             if rel == self.select[1]:
-                node = leaf
-                while node := node.parent:
-                    node.expand()
-                tree.move_cursor(leaf)  # FIXME: node not selected and size & mtime not rendered
+                self.call_after_refresh(tree.move_cursor, node)
             with suppress(Exception):
                 assert rel == self.brok.pimg and path.is_file()
                 self.on_preview(path)
 
-        snap.walk(on_dirs=add_node)
-        snap.walk(on_file=add_leaf)
-        tree.root.label = f'{snap.fcnt} {self("files")}'
-        self.select[1] = tree.cursor_node and tree.cursor_node.data[0]
-
     def on_tree_node_selected(self, evt: ttw.Tree.NodeSelected) -> None:
         self.select[1] = rel = evt.node.data[0]
-        if not self.brok.pimg or self.select[0] not in self.brok.snaps:
+        if not self.brok.pimg:
             return
         snap = self.brok.snaps[self.select[0]]
         if rel not in snap.info:  # dirs
@@ -2210,17 +2434,18 @@ class GameSnapTUI(textual.app.App, UIMixin, AskMixin):
             self.on_preview(path)
 
 
-class GameSnapGUI(ttk.Window, UIMixin):
+class SnapGUI(ttk.Window, UIMixin):
+    '''Graphical UI by tkinter and ttkbootstrap'''
     def __init__(self, *a, **k) -> None:
-        bind = awareness() is not None
+        success = awareness()   # before root rendered
         super().__init__(title=' '.join(APPINFO), themename='yeti', iconphoto=ICOFILE, hdpi=False)
-        if bind:
-            self.set_wndproc()
+        if success:
+            self.set_wndproc()  # after window created
         UIMixin.__init__(self, *a, **k)
 
         self.vars = {}
         self.emoji = {}
-        for key in self.brok.aliases:
+        for key in self.brok.__aliases__:
             val = self.brok[key]
             self.vars[key] = {
                 bool: ttk.BooleanVar, int: ttk.IntVar
@@ -2288,7 +2513,7 @@ class GameSnapGUI(ttk.Window, UIMixin):
             self[f'opts.{name}'].bind('<Button-1>', lambda e, n=name: self.on_record(n))
             self[f'opts.!{name}'].config(text=text, bootstyle='link')
         self['opts.pname'].bind('<Return>', lambda e: self.sync_process(True))
-        self['opts.proc'].bind('<Button-1>', lambda e: self.sync_process(True))
+        self['opts.proc'].bind('<Double-1>', lambda e: self.sync_process(True))
         self.set_state('opts.wbox', self.vars['watch'].get())
         self.set_state('opts.sbox', self.vars['sched'].get())
         return frame
@@ -2300,12 +2525,14 @@ class GameSnapGUI(ttk.Window, UIMixin):
         tree.heading('type', anchor='center')
         tree.column('type', width=100, anchor='center', stretch='no')
         tree.heading('size', anchor='e')
-        tree.column('size', width=110, anchor='e', stretch='no')
+        tree.column('size', width=120, anchor='e', stretch='no')
         tree.bind('<<TreeviewSelect>>', self.on_select)
+        tree.bind('<F2>', lambda e: e.widget.selection() and self.on_rename())
         tree.bind('<F5>', lambda e: self.brok.on_snaps(True))
         tree.bind('<Escape>', lambda e: e.widget.selection_set(()))
         tree.bind('<Delete>', lambda e: e.widget.selection() and self.on_delete())
         tree.bind('<Return>', lambda e: e.widget.selection() and self.on_restore())
+        tree.bind('<Double-1>', lambda e: browse(next(iter(e.widget.selection()), None)))
         tree.pack(fill='both', expand=True, padx=P, pady=P)
         for elem in [
             ttk.Button(frame, name='create', command=self.on_create),
@@ -2322,13 +2549,14 @@ class GameSnapGUI(ttk.Window, UIMixin):
         tree = ttk.Treeview(frame, name='tree', columns=['size', 'mtime'])
         tree.column('#0', width=300)
         tree.heading('size', anchor='e')
-        tree.column('size', width=110, anchor='e', stretch='no')
+        tree.column('size', width=120, anchor='e', stretch='no')
         tree.heading('mtime', anchor='center')
         tree.column('mtime', width=230, anchor='center', stretch='no')
         tree.bind('<<TreeviewSelect>>', self.on_select)
-        tree.bind('<<TreeviewOpen>>', lambda e: self.add_leaf({Path(tree.focus())}))
+        tree.bind('<<TreeviewOpen>>', lambda e: self.add_leaf({tree.focus()}))
         tree.tag_bind('c', '<<TreeviewOpen>>', lambda e: tree.item(tree.focus(), tags=('o', )))
         tree.tag_bind('o', '<<TreeviewClose>>', lambda e: tree.item(tree.focus(), tags=('c', )))
+        tree.tag_configure('d', foreground='grey')
         tree.tag_configure('o', image=self.from_emoji('📂'))
         tree.tag_configure('c', image=self.from_emoji('📁'))
         tree.tag_configure('f', image=self.from_emoji('📄'))
@@ -2498,11 +2726,11 @@ class GameSnapGUI(ttk.Window, UIMixin):
             tree.delete(*tree.get_children())
         old, new = tree.get_children(), list(self.brok.snaps)
         tree.delete(*(p for p in old if p not in new))
-        for i, pstr in enumerate([p for p in new if p not in old]):
+        for i, pstr in enumerate(p for p in new if p not in old):
             snap = self.brok.snaps[pstr]
             size = size_format(snap.size)
             stype = self(snap.type)
-            tree.insert('', i, pstr, text=snap.path.name, values=(stype, size))
+            tree.insert('', i, pstr, text=snap.name or snap.path.name, values=(stype, size))
         if self.brok.snaps:
             tree.heading('#0', text=f'{len(self.brok.snaps)}/{self.brok.bcnt} {self("snaps")}')
         else:
@@ -2512,10 +2740,10 @@ class GameSnapGUI(ttk.Window, UIMixin):
         '''update process name and button style after optional toggle'''
         if auto is not None:
             self.brok.toggle_mode(auto)
-        if isinstance(self.brok.start, int) and self.brok.proc:
-            t, b, p = self('manual'), 'success' if self.brok.start else 'warning', 'default'
-        else:
+        if isinstance(self.brok.start, bool) or not self.brok.proc:
             t, b, p = self('stop' if self.brok.start else 'start'), 'primary', 'warning'
+        else:
+            t, b, p = self('manual'), 'success' if self.brok.start else 'warning', 'default'
         self['snap.!toggle'].config(text=t, bootstyle=b)
         self['opts.pname'].config(bootstyle=p)
         self['opts.proc'].config(bootstyle=p)
@@ -2524,7 +2752,7 @@ class GameSnapGUI(ttk.Window, UIMixin):
         '''update button states'''
         self.set_state('path.browse#sdir', self.brok.sdir.is_dir())
         self.set_state('path.browse#bdir', self.brok.bdir.is_dir())
-        snap = self.brok.snaps.get((self['snap.tree'].selection() or [None])[0])
+        snap = self.brok.snaps.get(next(iter(self['snap.tree'].selection()), None))
         for wid in ['restore', 'export', 'delete']:
             self.set_state(f'list.{wid}', snap)
         self['list.restore'].config(bootstyle='warning' if self.brok.start > 1 else 'default')
@@ -2536,7 +2764,7 @@ class GameSnapGUI(ttk.Window, UIMixin):
 
     def on_destroy(self) -> None:
         '''save config and exit'''
-        self.brok.dump(CFGFILE)
+        self.brok.config.path.name and self.brok.config.dump(self.brok.config.path)
         self.destroy()
 
     def on_collapse(self, e: tk.Widget, vertical: bool = True) -> typing.Callable[[], None]:
@@ -2570,7 +2798,7 @@ class GameSnapGUI(ttk.Window, UIMixin):
         def wrapper() -> None:
             self.set_state(btn, False)
             btn.config(text='esc to cancel')
-            self.vars[name].set(self.brok.record_hotkey(name, log=lambda t: btn.config(text=t)))
+            self.vars[name].set(self.brok.on_hotkey(name, log=lambda t: btn.config(text=t)))
             btn.config(text=self.vars[name].get() or 'click to set')
             self.set_state(btn, True)
         threading.Thread(target=wrapper, name='record-hotkey', daemon=True).start()
@@ -2602,19 +2830,19 @@ class GameSnapGUI(ttk.Window, UIMixin):
         finally:
             self.after(50, lambda: self.vars[key].set(self.brok[key]))  # recursive
 
-    def add_leaf(self, parents: set[Path]) -> None:
+    def add_leaf(self, parents: set[str]) -> None:
         snap = self.brok.snaps[self['snap.tree'].selection()[0]]
         tree = self['list.tree']
         for rel in snap.flat:
-            rpath = Path(rel)
-            parent = rpath.parent
-            if parent not in parents:
+            head, tail = os.path.split(rel)
+            if head not in parents:
                 continue                # lazy loading
+            if tree.exists(head + '.dummy'):
+                tree.delete(head + '.dummy')
             if tree.exists(rel):
                 break                   # already loaded
             path, dsize, rsize, mtime = snap.info[rel]
-            pid = parent.name and str(parent) or ''
-            tree.insert(pid, 'end', id=rel, text=rpath.name, values=(
+            tree.insert(head, 'end', id=rel, text=tail, values=(
                 size_format(dsize), mtime and strftime(mtime) or ''
             ), tags=('f', ))
             with suppress(Exception):
@@ -2628,19 +2856,21 @@ class GameSnapGUI(ttk.Window, UIMixin):
         selection = e.widget._last_selection = e.widget.selection()
         if e.widget is self['snap.tree']:
             tree = self['list.tree']
-            snap = self.brok.snaps.get((selection or [''])[0])
+            snap = self.brok.snaps.get(next(iter(selection), None))
             item = set(tree.selection())
             tree.delete(*tree.get_children())
             tree._last_selection = None
-            self.on_preview(getattr(snap, 'view', None))
+            self.on_preview(getattr(snap, 'view', False))
             self.sync_buttons()
             if not snap:
                 return tree.heading('#0', text='')
-            parents = {p for i in item for p in Path(i).parents} | {Path('.')}
-            snap.walk(on_dirs=lambda r, s: tree.insert(
-                r.parent.name and str(r.parent) or '', 'end',
-                id=str(r), text=r.name, open=r in parents, tags=('co'[r in parents], )
-            ))
+            parents = item | {str(p) for i in item for p in Path(i).parents[:-1]}
+            for rel, (nfile, tsize, mtime) in snap.dirs.items():
+                head, tail = os.path.split(rel)
+                tree.insert(head, 'end', id=rel, text=tail, values=(
+                    size_format(tsize), mtime and strftime(mtime) or ''
+                ), open=rel in parents, tags=('co'[rel in parents], ))
+                nfile and tree.insert(rel, 'end', id=rel + '.dummy', tags=('d', ))
             self.add_leaf(parents)
             tree.heading('#0', text=f'{snap.fcnt} {self("files")}')
             tree.selection_set(tuple(filter(tree.exists, item)))
@@ -2661,7 +2891,7 @@ class GameSnapGUI(ttk.Window, UIMixin):
                     self.on_preview(snap.view)
 
     def on_preview(self, e: tk.Event | Image.Image | Path | bool = False) -> None:
-        '''preview image of snapshot specified by GameSnapConfig.preview_filepath'''
+        '''preview image of snapshot specified by SnapConfig.preview_filepath'''
         pimg = self['list.!preview']
         data = pimg.data
         last = data['image']
@@ -2671,7 +2901,7 @@ class GameSnapGUI(ttk.Window, UIMixin):
             data.update({'path': None, 'image': e})
             if not last:
                 return pimg.grid()
-        elif isinstance(e, _Path):                          # show thumbnail
+        elif isinstance(e, Path):                           # show thumbnail
             if data['path'] == e:
                 return
             elif e.suffix == '.zstd':
@@ -2684,10 +2914,13 @@ class GameSnapGUI(ttk.Window, UIMixin):
         elif not e or not data['image']:                    # hide preview
             data['path'] = data['image'] = data['tkimg'] = None
             return pimg.grid_remove()
-        size = (max(1, self['list.tree'].winfo_width() - 4), max(1, self['opts'].winfo_height()))
+        size = (
+            max(1, self['list.tree'].winfo_width() - 4),
+            max(1, min(self['opts'].winfo_height(), self['list'].winfo_height() / 2))
+        )
         if size != data['image'].size:                      # resize widget
             tmp = data['image'].copy()
-            tmp.thumbnail(size, Image.Resampling.LANCZOS)
+            tmp.thumbnail(size, Image.Resampling.LANCZOS)   # FIXME: debounce
             data['tkimg'] = ImageTk.PhotoImage(tmp)         # save to avoid gc
         elif not data['tkimg']:
             data['tkimg'] = ImageTk.PhotoImage(data['image'])
@@ -2737,11 +2970,20 @@ class GameSnapGUI(ttk.Window, UIMixin):
         if messagebox.askyesno(self('delete') + '?', record, icon='warning'):
             self.on_service('list.delete', self.brok.delete, record)
 
+    def on_rename(self) -> None:
+        '''rename the selected snapshot'''
+        snap = self.brok.snaps.get(self['snap.tree'].selection()[0])
+        if snap and snap.path and (name := simpledialog.askstring(
+            self('rename'), snap.path.name + (f'\n - {snap.name}' if snap.name else '')
+        )) not in (None, snap.name):
+            with self.brok._mutex:
+                snap.name = name
+                snap.dump(snap.path)
+            self['snap.tree'].item(str(snap.path), text=snap.name or snap.path.name)
+
 
 def find_mods(root: Path, gid: int = 0) -> dict[int, list[tuple[int, int, str, Path]]]:
     '''search mods under root and filter by optional game id'''
-    if 'steamapps' not in root.parts:
-        root /= 'steamapps/workshop/content'
     gstr = gid and str(gid) or ''
     mods, cache = {}, {}
     for acf in root.parent.glob('appworkshop_*.acf'):
@@ -2764,9 +3006,11 @@ def find_mods(root: Path, gid: int = 0) -> dict[int, list[tuple[int, int, str, P
                     continue
                 if workshop.name in cache:
                     size = cache[workshop.name]['size']
+                    mtime = cache[workshop.name]['timeupdated']
                 else:
                     size = sum(map(lambda p: p.is_file() and p.stat().st_size, mod.rglob('*')))
-                lst.append((wid, mod.stat().st_mtime, mod.name, size, mod))
+                    mtime = mod.stat().st_mtime
+                lst.append((wid, mtime, mod.name, size, mod))
     if not mods:
         if not gid:
             logger.warning(f'No workshops under {root}')
@@ -2776,6 +3020,17 @@ def find_mods(root: Path, gid: int = 0) -> dict[int, list[tuple[int, int, str, P
 
 
 def steam_cmd(cmd: Path, yes: bool = False) -> Path | None:
+    '''
+    Validate SteamCMD executable or download and install if not found.
+
+    Args:
+        cmd (Path): path to steamcmd.exe or steamcmd.sh
+        yes (bool): assume answer "yes" to any prompts
+
+    Returns:
+        Path: path to installed SteamCMD executable
+        None: not found or install failed
+    '''
     if cmd.is_file() and 'version' in exec_result(cmd, '--help').lower():
         return cmd
     if not yes and input(
@@ -2783,7 +3038,7 @@ def steam_cmd(cmd: Path, yes: bool = False) -> Path | None:
         'About 700KB to download and 100MB after installed\nY/[N]: '
     ).lower() != 'y':
         return logger.error(f'Invalid SteamCMD: {cmd}')
-    suffix = {'darwin': '_osx.tar.gz', 'linux': '_linux.tar.gz'}.get(sys.platform, '.zip')
+    suffix = {'Darwin': '_osx.tar.gz', 'Linux': '_linux.tar.gz'}.get(platform.system(), '.zip')
     cmd = cmd.parent / f'steamcmd{steam_cmd.suffix}'
     try:
         path, msg = urllib.request.urlretrieve(
@@ -2793,10 +3048,8 @@ def steam_cmd(cmd: Path, yes: bool = False) -> Path | None:
         logger.info(msg.as_string().strip())
         shutil.unpack_archive(path, cmd.parent)
         logger.warning('It may take a few minutes to setup SteamCMD...')
-        with exec_command(cmd, '--help', bufsize=1) as proc:
-            while line := proc.stdout.readline():
-                rprint(line.rstrip())
-        assert not proc.poll(), 'initialization error'
+        for line in line_buffer(cmd, '--help', check=True):
+            rprint(line)
         return cmd
     except Exception:
         cmd.unlink(missing_ok=True)
@@ -2808,7 +3061,7 @@ steam_cmd.suffix = '.exe' if WINDOWS else '.sh'
 
 def steam_post(api: str, data: dict, timeout: int = 3) -> dict:
     with urllib.request.urlopen(
-        urllib.request.urljoin('https://api.steampowered.com', api),
+        urllib.parse.urljoin('https://api.steampowered.com', api),
         urllib.parse.urlencode(data).encode(), timeout=timeout
     ) as rep:
         data = json.load(rep)['response']
@@ -2818,12 +3071,12 @@ def steam_post(api: str, data: dict, timeout: int = 3) -> dict:
 
 def local_link(path: str | Path, title: typing.Any = None) -> str:
     '''markup for local files or folders'''
-    return f'[link={Path(path).absolute().as_uri()}]{title or path}[/]'
+    return f'[link={abspath(path).as_uri()}]{title or path}[/link]'
 
 
 def steam_link(id: int, title: typing.Any = None) -> str:
     '''markup for steam collection / workshop page'''
-    return f'[link=https://steamcommunity.com/sharedfiles/filedetails/?id={id}]{title or id}[/]'
+    return f'[link=https://steamcommunity.com/sharedfiles/filedetails/?id={id}]{title or id}[/link]'
 
 
 def query_wids(*ids: int) -> typing.Iterator[int]:
@@ -2862,10 +3115,35 @@ def query_gids(*ids: int) -> typing.Iterator[tuple[int, int]]:
         yield wid, gid
 
 
-def run_modman(args: argparse.Namespace, *a) -> None:
-    '''list or update steam workshops'''
+def run_modman(args: argparse.Namespace, _: SnapBroker) -> None:
+    '''list or download steam workshops'''
     if not args.mdir:
         args.mdir = args.exec.parent
+    mparts, sparts = args.mdir.parts, Path('steamapps/workshop/content').parts
+    for i in range(len(mparts) - len(sparts) + 1):
+        if mparts[i:i + len(sparts)] == sparts:         # crop until suffix
+            cdir = Path(*mparts[:i + len(sparts)])
+            break
+    else:                                               # pad with suffix
+        match = 0
+        for i in range(1, min(len(mparts), len(sparts)) + 1):
+            if mparts[-i:] == sparts[:i]:
+                match = i
+        cdir = Path(*mparts[:-match if match else None]).joinpath(*sparts)
+    logger.debug(f'Using {cdir}')
+    if not args.ids and not args.sync and not args.copy:
+        for gid, lst in find_mods(cdir, args.gid).items():
+            nwid, size = len({d[0] for d in lst}), sum({d[0]: d[3] for d in lst}.values())
+            rprint(f'Game {gid} found {size_format(size):>9s} {nwid} workshops and {len(lst)} mods')
+            if not args.verbose:
+                continue
+            lst = sorted(lst, key=lambda d: d[{'TIME': 1, 'NAME': 2, 'SIZE': 3}.get(args.sort, 0)])
+            for i, (wid, mtime, name, size, path) in enumerate(lst):
+                slink, flink = steam_link(wid), local_link(path, name)
+                if mtime > tree_mtime(path, path.stat().st_mtime):
+                    flink = f'[dim]{flink}[/dim]'
+                rprint(f'   - [{slink}] {size_format(size):>9s} {strftime(mtime)} {flink}')
+        return
     try:
         wids = dict(query_gids(*query_wids(*set(args.ids))))
     except Exception as e:
@@ -2876,178 +3154,390 @@ def run_modman(args: argparse.Namespace, *a) -> None:
         else:
             logger.warning(f'Skip downloading {args.ids}, please specify GID')
     if args.sync:
-        wids.update({d[0]: gid for gid, lst in find_mods(args.mdir, args.gid).items() for d in lst})
-    elif not args.ids and not args.copy:
-        for gid, lst in find_mods(args.mdir, args.gid).items():
-            nwid, size = len({d[0] for d in lst}), sum({d[0]: d[3] for d in lst}.values())
-            rprint(f'Game {gid} found {size_format(size):>9s} {nwid} workshops and {len(lst)} mods')
-            if not args.verbose:
-                continue
-            lst = sorted(lst, key=lambda d: d[{'TIME': 1, 'NAME': 2, 'SIZE': 3}.get(args.sort, 0)])
-            for i, (wid, mtime, name, size, path) in enumerate(lst):
-                slink, flink = steam_link(wid), local_link(path, name)
-                rprint(f'   - [{slink}] {size_format(size):>9s} {strftime(mtime)} {flink}')
+        wids.update({d[0]: gid for gid, lst in find_mods(cdir, args.gid).items() for d in lst})
     if wids and (cmd := steam_cmd(args.exec, args.yes)):
         logger.info(f'Using {cmd} to download {len(wids)} workshops')
+        tpl, done = re.compile(r'Success[^\d]*(\d+).*\1[^\d]*(\d+)'), {}
+        # SteamCMD logs maybe messy so regex is used to extract valid information
         with tempfile.NamedTemporaryFile(delete_on_close=False) as script:
             script.write('\n'.join([f'force_install_dir "{args.mdir}"', 'login anonymous'] + [
                 f'workshop_download_item {gid} {wid}' for wid, gid in wids.items()
             ]).encode())
             script.close()
-            with exec_command(cmd, f'+runscript "{script.name}"', '+quit', bufsize=1) as proc:
-                while line := proc.stdout.readline():
-                    if line.startswith('Success'):
-                        logger.info(line[9:].split(')')[0] + ')')
-                    elif line.startswith('Error'):
-                        logger.warning(line.rstrip())
+            for line in line_buffer(cmd, f'+runscript "{script.name}"', '+quit'):
+                if 'error' in line.lower():
+                    logger.error(line[0 if args.verbose else 7:])
+                elif args.verbose:
+                    logger.debug(line)
+                if 'success' not in line.lower():
+                    continue
+                for wid in (matched := dict(
+                    map(int, pair) for pair in tpl.findall(line)
+                )).keys():
+                    if wid not in wids:
+                        matched = {}
+                if not matched and not args.verbose:
+                    logger.info(line)
+                for wid, size in matched.items():
+                    if wid in done:
+                        continue
+                    size = size_format(done.setdefault(wid, size))
+                    logger.info(f'{len(done)}/{len(wids)} downloaded {steam_link(wid)} {size}')
     if args.copy:
-        mods = find_mods(args.mdir)
-        if args.gid and args.gid not in mods:
+        games = find_mods(cdir)
+        if args.gid and args.gid not in games:
             return logger.error(f'Game ID {args.gid} not found')
-        elif not args.gid and len(mods) == 1:
-            args.gid = list(mods)[0]
+        elif not args.gid and len(games) == 1:
+            args.gid = list(games)[0]
         elif not args.gid:
-            return logger.warning(f'Choose game ID from {list(mods)}')
-        lst = mods[args.gid]
-        logging.info(f'Syncing {args.gid} {len(lst)} mods')
-        with poolmap(lst) as pmap:
-            for dst in pmap(lambda w, m, name, s, path: shutil.copytree(
-                path, args.copy / name, dirs_exist_ok=True
-            ), *zip(*lst)):
-                logger.info(dst)
+            return logger.warning(f'Choose game ID from {list(games)}')
+        mods = {path: name for w, m, name, s, path in games[args.gid]}
+        olds = {m.name for m in os.scandir(args.copy) if m.is_dir()}
+        logger.info(f'Syncing {len(mods)} mods for game {args.gid}')
+        with poolmap(mods) as pmap:
+            for dst in pmap(lambda src, dst: shutil.copytree(
+                src, args.copy / dst, dirs_exist_ok=True
+            ), mods.keys(), mods.values()):
+                if dst.name in olds:
+                    logger.info(f'[yellow]~[/] {local_link(dst, dst.name)}')
+                else:
+                    logger.info(f'[green]+ {local_link(dst, dst.name)}[/]')
+        for mod in olds.difference(mods.values()):
+            logger.warning(f'[red]- {local_link(args.copy / mod, mod)}[/]')
 
 
-def run_test(args: argparse.Namespace, brok: GameSnapBroker) -> None:
+try:
+    from packaging.version import Versio as Version
+except Exception:
+    @functools.total_ordering
+    class Version:
+        '''Simple semantic version parser like packaging.version.Version'''
+        _tpl = re.compile(
+            r'(?P<major>0|[1-9]\d*)\.'
+            r'(?P<minor>0|[1-9]\d*)\.'
+            r'(?P<patch>0|[1-9]\d*)'
+            r'(?:\-(?P<pre>[\w-]+(?:\.[\w-]+)*))?'
+            r'(?:\+(?P<build>[\w-]+(?:\.[\w-]+)*))?'
+        )
+
+        def __init__(self, version: str) -> None:
+            m = self._tpl.search(str(version))
+            if not m:
+                raise ValueError(f'Invalid semantic version {version}')
+            self._ver = tuple(int(i) for i in m.groups()[:3]) + m.groups()[3:]
+            self._raw = m.group()
+
+        def __str__(self) -> str: return self._raw
+
+        def __repr__(self) -> str: return f"<Version('{self._raw}')>"
+
+        def __hash__(self) -> int: return hash(self._ver)
+
+        def __eq__(self, o: typing.Any) -> bool:
+            if not isinstance(o, Version):
+                try:
+                    return self == Version(o)
+                except ValueError:
+                    return NotImplemented
+            return self._ver[:4] == o._ver[:4]
+
+        def __lt__(self, o: typing.Any) -> bool:
+            if not isinstance(o, Version):
+                try:
+                    return self < Version(o)
+                except ValueError:
+                    return NotImplemented
+            if self._ver[:3] != o._ver[:3]:
+                return self._ver[:3] < o._ver[:3]
+            if self._ver[3] is not None and o._ver[3] is not None:
+                aparts, bparts = self._ver[3].split('.'), o._ver[3].split('.')
+                for a, b in zip(aparts, bparts):
+                    if a != b:
+                        if a.isdigit() and b.isdigit():
+                            return int(a) < int(b)
+                        return True if a.isdigit() else (False if b.isdigit() else a < b)
+                return len(aparts) < len(bparts)
+            return self._ver[3] is not None and o._ver[3] is None
+
+
+def asset_name(tpl: str, version: str | Version) -> str:
+    system, machine = platform.system().lower(), platform.machine().lower()
+    return tpl.format(
+        name=PROJECT, plat='macos' if system == 'darwin' else system,
+        arch={'aarch64': 'arm64', 'arm64': 'arm64'}.get(machine, 'x86_64'),
+        ver=version, ext='.exe' if WINDOWS else ''
+    )
+
+
+def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
+    '''check and download updates'''
+    current = abspath(sys.argv[0])  # follow symlink
+    if args.gen:
+        if not ONEFILE:
+            for path in (BASEDIR / 'build').glob(f'{PROJECT}*{".exe" if WINDOWS else ""}'):
+                if path.is_file():
+                    break
+            else:
+                return logger.error('Could not generate version info from source file')
+        else:
+            path = current
+        if path.parent != args.gen:
+            src, path = path, shutil.copy2(path, args.gen.mkdirp() / path.name)
+            logger.info(f'Copied {src} => {path}')
+        if '{name}' not in args.match:
+            args.match = ('{name}-' + args.match).replace('--', '-')
+        info = dump({'tag_name': VERSION, 'assets': [{
+            'name': asset_name(args.match, VERSION),
+            'size': path.stat().st_size,
+            'digest': 'md5:' + hashlib.md5(path.read_bytes()).hexdigest(),
+            'updated_at': strftime(path.stat().st_mtime, '%FT%XZ'),
+            'browser_download_url': path.name,
+        }]}, args.gen / 'latest')
+        logger.info(info.read_text())
+        return 'Test with --url=' + info.parent.as_uri()
+    if args.ppid:
+        logger.info(f'Welcome to {VERSION}')
+        if not args.keep:
+            with suppress(psutil.NoSuchProcess, psutil.AccessDenied):
+                psutil.Process(args.ppid).wait(5)
+            with suppress(PermissionError):
+                current.with_suffix('.old').unlink(missing_ok=True)
+        if not args.args:
+            return logger.warning('Nothing to do')
+        argv = [str(current), *args.args]
+        return os.execv(argv[0], argv) if ONEFILE else logger.debug(f'Running {argv}')
+    try:
+        with urllib.request.urlopen(
+            f'https://api.github.com/repos/{"/".join(args.repo)}/releases/latest'
+            if not args.url else urllib.parse.urljoin(args.url, 'latest'), timeout=3
+        ) as rep:
+            data = json.load(rep)
+            assets = data['assets']
+        newver = Version(data['tag_name'])
+    except Exception:
+        return logger.exception(f'Failed to fetch version from {args.url or args.repo}')
+    if not args.force and newver <= VERSION:
+        return logger.info(f'Skip version {newver}')
+    logger.info(f'Found verseion {newver} (current {VERSION})')
+    suffix = asset_name(args.match, newver)
+    for asset in assets:
+        if asset['name'].endswith(suffix):
+            break
+    else:
+        return logger.error('\n - '.join([
+            'No candidates to download, please choose from:',
+            *(asset['name'] for asset in assets)
+        ]))
+    logger.info(f'Found {asset["name"]} {size_format(asset["size"])} {asset["updated_at"]}')
+    target = BASEDIR / Path(asset['name']).name
+    digest, _, hval = str(asset['digest']).lower().partition(':')
+    hasher = hashlib.new(digest) if digest in hashlib.algorithms_available else None
+    try:
+        with urllib.request.urlopen(
+            urllib.parse.urljoin(args.url, asset['browser_download_url'])
+            if args.url else asset['browser_download_url'], timeout=10
+        ) as rep, open(target, 'wb') as f:
+            while buf := rep.read(shutil.COPY_BUFSIZE):
+                hasher and hasher.update(buf)
+                f.write(buf)
+        if hasher and hasher.hexdigest() != hval:
+            target.unlink()
+            return logger.error(f'Download failed: {digest} does not match')
+    except Exception:
+        target.unlink(missing_ok=True)
+        return logger.exception('Failed to download executable')
+    try:
+        if not WINDOWS:
+            target.chmod(current.stat().st_mode if ONEFILE else 0o755)
+        for line in line_buffer(target, 'runtest', '--console', 'hide', check=True):
+            rprint(line)
+    except Exception:
+        target.unlink()
+        return logger.error('Self-test failed: skip this version')
+    try:
+        if not ONEFILE:                             # running from script
+            return logger.warning(f'Nothing to do: tested {target}')
+        with suppress(PermissionError):
+            if not args.keep:
+                current.unlink()
+                logger.info(f'Removed {current}')
+        if current.is_file():                       # keep or file locked
+            backup = current.with_suffix('.old')
+            backup.unlink(missing_ok=True)
+            shutil.move(current, backup)
+            logger.info(f'Backup {current} => {backup}')
+        if Path(sys.argv[0]).is_symlink():          # link to new version
+            os.unlink(sys.argv[0])
+            try:
+                os.symlink(target, sys.argv[0])
+                logger.info(f'Update {sys.argv[0]} => {target}')
+            except OSError as e:
+                if e.winerror != 1314:
+                    raise
+                logger.warning('Failed to creat symlink on Windows')
+        elif VERSION not in current.stem:           # replace executable
+            logger.info(f'Rename {target} => {current}')
+            target = shutil.move(target, current)
+        else:
+            logger.warning(f'Skipped {current} with version info')
+    except Exception:
+        target.unlink()
+        return logger.exception('Failed to replace executable')
+    argv = [str(target), sys.argv[1], '--ppid', str(os.getpid()), *args.args]
+    logger.info(f'Goodbye from {VERSION}')
+    return os.execv(argv[0], argv) if ONEFILE else logger.debug(f'Running {argv}')
+
+
+def run_test(_: argparse.Namespace, brok: SnapBroker) -> None:
     '''self-test and report errors'''
     with tempfile.TemporaryDirectory() as folder:
         base = Path(folder)
+        sdir = base / 'src'
+        bdir = base / 'dst'
+        hdir = bdir / 'blob'
+        code = sdir / 'code.py'
+        text = sdir / 'text.md'
+        cfg = base / 'config.json'
+        out = base / 'export.zip'
+        logger.info('TEST START'.center(20, '-'))
         try:
-            sdir = base / 'src'
-            bdir = base / 'dst'
-            hdir = bdir / 'blob'
-            text = sdir / 'text'
-            cfg = base / 'config.json'
-            out = base / 'export.zip'
-            logger.info('TEST START'.center(20, '-'))
             brok.update(cfg)
             assert cfg.is_file(), 'config file is not created'
             brok['knew'] = brok['ktog'] = brok['kdel'] = ''  # disable hotkey
+
             logger.info('set sdir'.center(20, '-'))
             with suppress(ValueError):
                 brok['sdir'] = sdir
                 assert False, 'source directory must exist'
             sdir.mkdir()
             brok['sdir'] = sdir
+
             logger.info('set bdir'.center(20, '-'))
             with suppress(ValueError):
                 brok['bdir'] = brok.sdir / 'nested'
                 assert False, 'nested directory is not supported'
             brok['bdir'] = bdir
+
             logger.info('create'.center(20, '-'))
+            code.write_text('print("hello world")')
+            brok['excs'] = '*.py'
             brok.create()
+            brok['excs'] = ''
             assert len(brok.summary()) == 1, 'no snapshot created'
+            assert brok.summary()[0].fcnt == 0, 'files not excluded'
+
             text.write_text('foo')
+            brok['incs'] = '*.md'
             brok.create()
+            brok['incs'] = ''
             assert len(brok.summary()) == 2, 'no snapshot created'
+            assert brok.summary()[0].fcnt == 1, 'files not included'
             assert len(list(hdir.iterdir())) == 1, 'blob files not created'
-            brok['wintv'], brok['sintv'] = 1, 1
+
+            # TODO: sdir is a file
+
+            logger.info('watchdog'.center(20, '-'))
+            brok['wintv'] = 1
             brok['watch'], brok['sched'] = True, False
             brok.start = True
-            logger.info('watchdog'.center(20, '-'))
             text.write_text('bar')
             time.sleep(1.5)
-            assert len(brok.summary()) == 3, 'new snapshot not created'
-            brok['watch'], brok['sched'] = False, True
-            logger.info('schedule'.center(20, '-'))
-            time.sleep(1.5)
-            assert len(brok.summary()) == 4, 'new snapshot not created'
             brok.start = False
-            snaps = brok.summary()
+            assert len(brok.summary()) == 3, 'new snapshot not created'
+
+            logger.info('schedule'.center(20, '-'))
+            brok['sintv'] = 1
+            brok['watch'], brok['sched'] = False, True
+            brok.start = True
+            time.sleep(1.5)
+            brok.start = False
+            assert len(brok.summary()) == 4, 'new snapshot not created'
+
             logger.info('summary'.center(20, '-'))
+            snaps = brok.summary()
             assert id(brok.summary()) == id(brok.summary()), 'cache not working'
+
             logger.info('restore'.center(20, '-'))
             brok.restore(snaps[-2].path)
             assert text.read_text() == 'foo', 'snapshot not restored'
+
             logger.info('export'.center(20, '-'))
             brok.export(snaps[0].path, out.with_suffix('.tgz'))
             assert out.is_file() and out.stat().st_size, 'zip file not exported'
+
             logger.info('delete'.center(20, '-'))
             brok.delete_latest()
             brok.delete_oldest()
             assert len(brok.summary()) == 2, 'lsnapshot not deleted'
+
             logger.info('max count'.center(20, '-'))
             brok['bcnt'] = 1
             brok.create()
             assert len(brok.summary()) == 1, 'snapshots not auto cleaned'
+
             logger.info('file missing'.center(20, '-'))
             for x in hdir.iterdir():
                 x.unlink()
             os.utime(brok.summary()[0].path)  # force cache miss
             data = list(brok.summary()[0].info.values())[0]
             assert not data[0].exists() or not any(data[1:]), 'blob files missing'
-            logger.info('TEST DONE'.center(20, '-'))
         except Exception:
             logger.exception('\n'.join(
                 f'{path.relative_to(base)} [{size_format(path.stat().st_size)}]'
                 for path in sorted(base.rglob('*'))
             ))
+            return 1
+        finally:
+            logger.info('TEST DONE'.center(20, '-'))
 
 
-def relpath(p: Path, o: Path = DATADIR) -> Path:
-    return p.relative_to(o) if p.is_relative_to(o) else p
-
-
-def filepath(s: str) -> Path:
-    path = abspath(s)
-    if not path.is_file():
-        raise argparse.ArgumentTypeError(f'{s} is not a file')
-    return path
-
-
-def run_delete(args: argparse.Namespace, brok: GameSnapBroker) -> str:
-    rst = brok.delete_all() if args.all else []
-    rst += [brok.delete(path) for path in args.record]
+def run_delete(args: argparse.Namespace, brok: SnapBroker) -> str:
+    rst: list[Path] = brok.delete_all() if args.all else []
+    rst += [brok.delete(path) for path in args.records]
     rst += [brok.delete_latest() for _ in range(args.latest)]
     rst += [brok.delete_oldest() for _ in range(args.oldest)]
-    return '\n - '.join(['Deleted', *map(str, rst)]) if rst else 'No snapshots to delete'
+    if not rst:
+        return 'No snapshots to delete'
+    return ('\n - ' if len(rst) > 1 else ' ').join(['Deleted', *map(str, rst)])
 
 
-def run_summary(args: argparse.Namespace, brok: GameSnapBroker) -> str:
+def run_summary(args: argparse.Namespace, brok: SnapBroker) -> str:
     snaps = brok.summary(detail=bool(args.size))
     for snap in snaps:
         if args.size:
             rsize, dsize = sum(v[1] for v in snap.flat.values()), snap.size
-            size = f'{size_format(rsize)} => {size_format(dsize)} ({dsize / rsize:.2%})'
+            size = f'{size_format(dsize)} <= {size_format(rsize)} ({dsize / rsize:.2%})'
         else:
             size = ''
         rprint(strftime(snap.time), f'{snap.type:6s}', snap.fcnt, 'files', size)
-        rprint(f' - source: {snap.sdir}\n - hashes: {snap.hdir}\n - record: {snap.path}')
+        if snap.name:
+            rprint(f' - rename: {snap.name}')
+        rprint(f' - source: {snap.sdir}\n - hashes: {snap.hdir}\n - record: {snap.path}\n')
     if not snaps:
         return f'No snapshots under {brok.bdir}'
-    count = len({k for snap in snaps for k in snap.flat})
-    msg = f'Found {len(snaps):^3d} of {brok.bcnt:2d} max, total {count} files'
+    msg = f'Found {len(snaps)} of {brok.bcnt} max'.ljust(len(strftime()) + 1)
     if args.size:
-        rsize = sum({k: v[1] for snap in snaps for k, v in snap.flat.items()}.values())
+        msg += f' Total {len({k for snap in snaps for k in snap.flat})} files'
         dsize = sum(itertools.chain(
             (snap.path.stat().st_size for snap in snaps),
-            {k: v[1] for snap in snaps for k, v in snap.info.items()}.value()
+            {k: v[1] for snap in snaps for k, v in snap.info.items()}.values()
         ))
-        msg += f' {size_format(rsize)} => {size_format(dsize)} ({dsize / rsize:.2%})'
+        msg += f' {size_format(dsize)}'
     return msg
 
 
-def run_daemon(args: argparse.Namespace, brok: GameSnapBroker) -> None:
+def run_daemon(args: argparse.Namespace, brok: SnapBroker) -> None:
     if not any(brok.srvs.values()):
-        logger.warning(f'Broker has nothing to do: check {args.cfg}')
+        logger.warning(f'Broker has nothing to do: check {args.config}')
     logger.info(f'Running {PROJECT} in background: press Ctrl+C to stop')
     with pidfile(args.pid), redirect(args.log):
         while True:
             time.sleep(1)
 
 
-def run_gui(args: argparse.Namespace, brok: GameSnapBroker) -> None:
+def run_gui(_: argparse.Namespace, brok: SnapBroker) -> None:
     try:
-        GameSnapGUI(brok).mainloop()
+        SnapGUI(brok).mainloop()
     except Exception as e:
         console(True)
         raise e
@@ -3060,12 +3550,35 @@ class ArgumentParser(argparse.ArgumentParser):
         self.parents = k.get('parents', [])
         super().__init__(*a, **k)
 
+    def __iter__(self) -> typing.Iterator[argparse.Action]: yield from self.walk(self)
+
+    @classmethod
+    def walk(cls, parser: argparse.ArgumentParser) -> typing.Iterator[argparse.Action]:
+        for action in parser._actions:
+            if action.nargs == argparse.PARSER:
+                for subparser in (action.choices or {}).values():
+                    yield from cls.walk(subparser) if subparser else []
+            else:
+                yield action
+
     def add_subparser(self, name: str, **k) -> typing.Self:
         if not hasattr(self, 'subparsers'):
             self.subparsers = self.add_subparsers(title='Supported commands', metavar='')
-        k.setdefault('description', k.get('help'))
         k.setdefault('parents', self.parents)
+        k.setdefault('add_help', not any([
+            isinstance(a, argparse._HelpAction) for p in k['parents'] for a in self.walk(p)
+        ]))
+        k.setdefault('description', k.get('help'))
         return self.subparsers.add_parser(name, **k)
+
+    def parse_args(self, *a, **k) -> argparse.Namespace:
+        args, argv = self.parse_known_args(*a, **k)
+        dest = next((a.dest for a in self if a.nargs == argparse.REMAINDER), '')
+        if argv and dest in args:
+            setattr(args, dest, getattr(args, dest) + argv)
+        elif argv:
+            self.error(argparse._('unrecognized arguments: %s') % ' '.join(argv))
+        return args
 
     def print_help(self, *a, **k) -> None:
         console(True)
@@ -3077,128 +3590,189 @@ class ArgumentParser(argparse.ArgumentParser):
 
 
 def make_parser() -> ArgumentParser:
-    shared = argparse.ArgumentParser(add_help=False)
-    shared.add_argument('-V', '--version', action='version', version=' '.join(APPINFO[1:]))
-    shared.add_argument('-v', '--verbose', action='count', help='show more log message')
-    config = argparse.ArgumentParser(add_help=False)
-    config.add_argument('-s', '--serial', action='store_true', help='disable concurrency')
-    config.add_argument('--cfg', metavar='PATH', type=abspath, default=CFGFILE,
-                        help=f'load config from file (default: [i] {relpath(CFGFILE)}[/])')
-    config.add_argument('--use', metavar=('FILE', 'GAME'), nargs=2,
-                        help='load [i]GAME[/] preset from [i]FILE[/]')
+    def urlparse(s: str) -> str:
+        url = urllib.parse.urlparse(s)
+        if not url.scheme or not any([url.netloc, url.path]):
+            raise argparse.ArgumentTypeError(f'{s} is not a valid URL')
+        return url.geturl() + '/'
+
+    def filepath(s: str) -> Path:
+        path = abspath(s)
+        if not path.is_file():
+            raise argparse.ArgumentTypeError(f'{s} is not a file')
+        return path
+
+    def parameter(s: str) -> tuple[str, typing.Any]:
+        key, _, val = s.partition('=')
+        if not key.strip():
+            raise argparse.ArgumentTypeError(f'{s} is not a parameter')
+        with suppress(json.JSONDecodeError):
+            val = json.loads(val.strip() or 'true')
+        return key.strip().lower(), val.strip() if isinstance(val, str) else val
+
+    class Preset(argparse.Action):
+        def __call__(self, p, ns, values, os=None):
+            try:
+                setattr(ns, self.dest, (filepath(values[0]), values[1]))
+            except argparse.ArgumentTypeError as e:
+                raise argparse.ArgumentError(self, e)
+
+    version = ' '.join(APPINFO[1:])
+    if ONEFILE and (gui := isgui()) is not None:
+        version += f' (Windows {"CG"[gui]}UI subsystem)'
+
+    gopt = argparse.ArgumentParser(add_help=False)
+    g = gopt.add_argument_group('Global Options')
+    g.add_argument('-h', '--help', action='help', help='show this help message and exit')
+    g.add_argument('-V', '--version', action='version', version=version)
+    g.add_argument('-v', '--verbose', action='count', help='show more log message')
+    g.add_argument('-c', '--console', metavar='MODE', choices=['show', 'hide', 'auto'],
+                   help='select mode from [[i]%(choices)s[/]] (default: [i]auto[/])')
+    g.add_argument('-s', '--serial', action='store_true', help='disable concurrency')
+
+    bopt = argparse.ArgumentParser(add_help=False)
+    g = bopt.add_argument_group('Broker Options')
+    g.add_argument('--config', metavar='PATH', type=abspath, default=CFGFILE,
+                   help=f'load config from file (default: [i] {relpath(CFGFILE)}[/])')
+    g.add_argument('--preset', metavar=('FILE', 'GAME'), nargs=2, action=Preset,
+                   help='load [i]GAME[/] preset from [i]FILE[/]')
+    g.add_argument('--param', type=parameter, metavar='KEY[=VAL]', nargs='+', action='extend',
+                   help='override config without saving and applied after [i]--preset[/]')
 
     parser = ArgumentParser(
-        prog=PROJECT, parents=[shared, config], description=DESCSTR,
-        epilog='See [cyan]<command> -h[/] for more helps',
+        prog=PROJECT, parents=[gopt, bopt], description=DESCSTR,
+        add_help=False, epilog='See [cyan]<command> -h[/] for more helps'
     )
     parser.set_defaults(task=run_gui, func=None)
 
-    sparser = parser.add_subparser('create', help='create a manual snapshot')
-    sparser.set_defaults(func=lambda a, b: f'Created at {b.create()}')
+    s = parser.add_subparser('create', help='create a manual snapshot')
+    s.set_defaults(func=lambda a, b: f'Created {b.create()}')
 
-    sparser = parser.add_subparser('restore', help='recover snapshots to [i]SDIR[/]')
-    sparser.add_argument('record', type=filepath, help='path to the snapshot')
-    sparser.add_argument('member', nargs='*', help='filter files by relative path')
-    sparser.add_argument('--sdir', help='source directory (default: [i]SDIR[/] from record)')
-    sparser.set_defaults(func=lambda a, b: f'Restored {b.restore(a.record, a.member, a.sdir)}')
+    s = parser.add_subparser('restore', help='recover a snapshot to [i]SDIR[/]')
+    s.add_argument('record', type=filepath, help='path to the snapshot')
+    s.add_argument('member', nargs='*', help='filter files by relative path')
+    s.add_argument('--sdir', help='source directory (default: [i]SDIR[/] from record)')
+    s.set_defaults(func=lambda a, b: f'Restored {b.restore(a.record, a.member, a.sdir)}')
 
-    sparser = parser.add_subparser('export', help='export snapshots to zip file')
-    sparser.add_argument('record', type=filepath, help='path to the snapshot')
-    sparser.add_argument('output', type=abspath, help='path to the zip file')
-    sparser.set_defaults(func=lambda a, b: f'Exported to {b.export(a.record, a.output)}')
+    s = parser.add_subparser('export', help='export a snapshot to zip file')
+    s.add_argument('record', type=filepath, help='path to the snapshot')
+    s.add_argument('output', type=abspath, help='path to the zip file')
+    s.set_defaults(func=lambda a, b: f'Exported {b.export(a.record, a.output)}')
 
-    sparser = parser.add_subparser('delete', help='delete snapshots and unused blob files')
-    group = sparser.add_mutually_exclusive_group(required=True)
-    group.add_argument('--record', metavar='PATH', nargs='*', default=[], type=filepath,
-                       help='remove specified snapshots')
-    group.add_argument('--latest', metavar='N', nargs='?', const=1, default=0, type=int,
-                       help='remove latest snapshots (default: [i]%(const)s[/])')
-    group.add_argument('--oldest', metavar='N', nargs='?', const=1, default=0, type=int,
-                       help='remove oldest snapshots (default: [i]%(const)s[/])')
-    group.add_argument('--all', action='store_true', help='remove all snapshots')
-    sparser.set_defaults(func=run_delete)
+    s = parser.add_subparser('delete', help='delete snapshots and unused blob files')
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument('records', metavar='PATH', nargs='*', default=[], type=filepath,
+                   help='remove specified snapshots')
+    g.add_argument('--latest', metavar='N', nargs='?', const=1, default=0, type=int,
+                   help='remove latest snapshots (default: [i]%(const)s[/])')
+    g.add_argument('--oldest', metavar='N', nargs='?', const=1, default=0, type=int,
+                   help='remove oldest snapshots (default: [i]%(const)s[/])')
+    g.add_argument('--all', action='store_true', help='remove all snapshots')
+    s.set_defaults(func=run_delete)
 
-    sparser = parser.add_subparser('summary', help='print snapshots under backup directory')
-    sparser.add_argument('--size', action='store_true', help='show detail of size info')
-    sparser.set_defaults(func=run_summary)
+    s = parser.add_subparser('summary', help='list snapshots under backup directory')
+    s.add_argument('--size', action='store_true', help='show detail of size info')
+    s.set_defaults(func=run_summary)
 
-    sparser = parser.add_subparser('runtest', help=run_test.__doc__, parents=[shared])
-    sparser.set_defaults(task=run_test)
+    s = parser.add_subparser('runtest', help=run_test.__doc__, parents=[gopt])
+    s.set_defaults(task=run_test)
 
     steamcmd = shutil.which('steamcmd' + steam_cmd.suffix) or shutil.which('steamcmd')
     steamcmd = abspath(steamcmd or f'~/.steamcmd/steamcmd{steam_cmd.suffix}')
-    sparser = parser.add_subparser('modman', help=run_modman.__doc__, parents=[shared])
-    sparser.add_argument('ids', metavar='ID', nargs='*', type=int,
-                         help='collection or workshop IDs to download / update')
-    sparser.add_argument('--exec', metavar='PATH', type=filepath, default=steamcmd,
-                         help='path to SteamCMD exec (default: %(default)s)')
-    sparser.add_argument('--mdir', type=abspath,
-                         help=f'path to download mods (default: [i]{steamcmd.parent}[/])')
-    sparser.add_argument('--copy', metavar='PATH', type=abspath,
-                         help='search [i]GID[/] mods under [i]MDIR[/] and copy to here')
-    sparser.add_argument('--sync', action='store_true', help='update all mods under [i]MDIR[/]')
-    sparser.add_argument('--sort', metavar='ATTR', choices=['ID', 'TIME', 'NAME', 'SIZE'],
-                         default='ID', help='sort mods by [i]%(choices)s[/] (default: %(default)s)')
-    sparser.add_argument('--gid', type=int, help='specify Steam Game ID')
-    sparser.add_argument('--yes', action='store_true', help='install SteamCMD if not found')
-    sparser.set_defaults(func=run_modman)
+    s = parser.add_subparser('modman', help=run_modman.__doc__, parents=[gopt])
+    s.add_argument('ids', metavar='ID', nargs='*', type=int,
+                   help='collection or workshop IDs to download / update')
+    s.add_argument('--exec', metavar='PATH', type=filepath, default=steamcmd,
+                   help='path to SteamCMD exec (default: %(default)s)')
+    s.add_argument('--mdir', type=abspath,
+                   help=f'path to download mods (default: [i]{steamcmd.parent}[/])')
+    s.add_argument('--copy', metavar='PATH', type=abspath,
+                   help='search [i]GID[/] mods under [i]MDIR[/] and copy to here')
+    s.add_argument('--sync', action='store_true', help='update all mods under [i]MDIR[/]')
+    s.add_argument('--sort', metavar='ATTR', choices=['ID', 'TIME', 'NAME', 'SIZE'], default='ID',
+                   help='sort mods by [[i]%(choices)s[/]] (default: %(default)s)')
+    s.add_argument('--gid', type=int, help='specify Steam Game ID')
+    s.add_argument('--yes', action='store_true', help='install SteamCMD if not found')
+    s.set_defaults(func=run_modman)
 
-    sparser = parser.add_subparser('daemon', help='run without user interface')
-    sparser.add_argument('--log', metavar='PATH', type=abspath, help='redirect stdout to logfile')
-    sparser.add_argument('--pid', metavar='PATH', nargs='?', type=abspath,
-                         const=abspath(tempfile.gettempdir()) / PROJECT.lower(),
-                         help='use and verify pidfile (default: [i]%(const)s[/])')
-    sparser.set_defaults(task=run_daemon)
+    s = parser.add_subparser('update', help=run_update.__doc__, parents=[gopt])
+    s.add_argument('args', nargs=argparse.REMAINDER, help='arguments to pass through')
+    s.add_argument('--match', metavar='TPL', default='-{plat}-{arch}{ext}',
+                   help='asset template [[i]name, plat, arch, ver, ext[/]] (default %(default)s)')
+    s.add_argument('--force', action='store_true', help='force update to legacy versions')
+    s.add_argument('--keep', action='store_true', help='do not clean up old versions')
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument('--url', type=urlparse, help='fetch latest version from URL')
+    g.add_argument('--repo', metavar=('USER', 'REPO'), nargs=2, default=REPOURL.split('/')[-2:],
+                   help='fetch latest release from github (default: %(default)s)')
+    g.add_argument('--ppid', metavar='PID', type=int, help='parent process id to wait for')
+    g.add_argument('--gen', metavar='DIR', type=abspath, help='generate version info')
+    s.set_defaults(func=run_update)
 
-    sparser = parser.add_subparser('tui', help='run terminal user interface')
-    sparser.add_argument('--css', type=filepath, nargs='+', help='load .tcss for debugging')
-    sparser.set_defaults(task=lambda a, b: GameSnapTUI(css=a.css, brok=b).run())
+    s = parser.add_subparser('daemon', help='run without user interface')
+    s.add_argument('--log', metavar='PATH', type=abspath, help='redirect stdout to logfile')
+    s.add_argument('--pid', metavar='PATH', nargs='?', type=abspath,
+                   const=abspath(tempfile.gettempdir()) / PROJECT.lower(),
+                   help='use and verify pidfile (default: [i]%(const)s[/])')
+    s.set_defaults(task=run_daemon)
 
-    sparser = parser.add_subparser('gui', help='run graphical user interface (default)')
-    sparser.set_defaults(task=run_gui)
+    s = parser.add_subparser('tui', help='run terminal user interface')
+    s.add_argument('--css', type=filepath, nargs='+', help='load .tcss for debugging')
+    s.set_defaults(task=lambda a, b: SnapTUI(css=a.css, brok=b).run())
+
+    s = parser.add_subparser('gui', help='run graphical user interface (default)')
+    s.set_defaults(task=run_gui)
     return parser
 
 
 def main() -> int:
-    args = make_parser().parse_args()
-    console(args.func or args.task is not run_gui, ' '.join(APPINFO[:0 if args.func else 2]))
-    if not args.cfg.is_file() and args.cfg != CFGFILE:
-        logger.warning(f'{args.cfg} does not exist: fallback to {CFGFILE}')
-        args.cfg = CFGFILE
-    if args.use:
-        args.use = [filepath(args.use[0]), args.use[1]]
-    if args.serial:
-        global POOLMAP
-        POOLMAP = False
-    brok = GameSnapBroker(args.cfg, verbose=args.verbose, srv=not args.func)
-    if args.use:
-        brok.preset(args.use[0], args.use[1])
-    if not args.func:
-        return args.task(args, brok)
-    ts = time.perf_counter()
-    if ret := args.func(args, brok).strip():
-        rprint(f'{ret}\n(used time: {time.perf_counter() - ts:.3f}s)')
+    try:
+        if WINDOWS:
+            signal.signal(signal.SIGBREAK, signal.default_int_handler)
+        args = make_parser().parse_args()
+        console({'show': True, 'hide': False}.get(
+            args.console, args.func or args.task is not run_gui
+        ), ' '.join(APPINFO[:0 if args.func else 2]))
+        if not args.config.is_file() and args.config != CFGFILE:
+            logger.warning(f'{args.config} does not exist: fallback to {CFGFILE}')
+            args.config = CFGFILE
+        if args.serial:
+            global POOLMAP
+            POOLMAP = False
+        brok = SnapBroker(args.config, verbose=args.verbose, srv=not args.func)
+        if args.preset:
+            logger.info(brok.preset(args.preset[0], args.preset[1])['result'])
+        if args.param:
+            logger.debug(f'Override params: {args.param}')
+            brok.update(dict(args.param))
+        if not args.func:
+            return args.task(args, brok)
+        ts = time.perf_counter()
+        if ret := (args.func(args, brok) or '').strip():
+            rprint(f'{ret}\n(used time: {time.perf_counter() - ts:.3f}s)')
+    except KeyboardInterrupt:
+        return 130  # 128 + SIGINT
+    except Exception:
+        logger.exception('')
+        return 1
 
 
 __all__ = [
     # classes
-    'Path', 'PZipFile', 'GameSnapConfig', 'GameSnapRecord', 'GameSnapEngine',
-    'GameSnapRouter', 'GameSnapBroker', 'GameSnapTUI', 'GameSnapGUI',
+    'Path', 'PZipFile', 'SnapTUI', 'SnapGUI',
+    'SnapConfig', 'SnapRecord', 'SnapEngine', 'SnapRouter', 'SnapBroker',
     # contants
-    'BASEDIR', 'DATADIR', 'CFGFILE', 'POOLMAP', 'APPINFO',
+    'ONEFILE', 'BASEDIR', 'DATADIR', 'CFGFILE', 'POOLMAP', 'APPINFO',
     # functions
-    'jload', 'jdump', 'tailf', 'pidof', 'where', 'browse', 'capture', 'console',
-    'poolmap', 'pidfile', 'redirect', 'awareness', 'play_sound', 'size_format',
-    'exec_result', 'exec_command'
+    'load', 'dump', 'tailf', 'pidof', 'where', 'isgui',
+    'browse', 'abspath', 'capture', 'console', 'poolmap',
+    'pidfile', 'redirect', 'strftime', 'awareness',
+    'play_sound', 'size_format', 'exec_result', 'exec_command', 'line_buffer',
 ]
 
 
-def __dir__() -> tuple[str]: return sorted(__all__)
+def __dir__() -> tuple[str]: return __all__
 
 
 if __name__ == '__main__':
-    try:
-        sys.exit(main())
-    except Exception:
-        logger.exception('')
-        sys.exit(1)
+    sys.exit(main())
