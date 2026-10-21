@@ -1,5 +1,4 @@
 *.exe
-*.lock
 dist*/
 build*/
 *egg-info/

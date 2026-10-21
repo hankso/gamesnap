@@ -40,7 +40,7 @@ GameSnap 是一个单文件 Python 应用（`GSnap.py`），用于游戏存档�
 
 `GameSnap[GUI]-[windows|linux|macos]-[amd64|arm64][.exe]`
 
-> `GameSnapGUI` 是 Windows GUI Subsystem 程序，双击运行时默认不显示终端，此外与 `GameSnap` 功能完全一致
+> `GameSnapGUI` 是 Windows GUI Subsystem 程序，双击运行时默认隐藏终端窗口，此外与 `GameSnap` 功能完全一致
 
 ### 方式二：从源码运行
 
@@ -158,27 +158,27 @@ GameSnap update --gen ./dist/
 
 默认配置文件为程序同目录下的 `config.json`，JSON 字段与短别名等价（HTTP API / 命令行均可用别名）：
 
-| JSON 字段 | 别名 | 默认值 | 说明 |
+| JSON 字段 | 别名 | 说明 | 默认值 |
 |---|---|---|---|
-| `watchdog_enabled` | `watch` | `false` | 启用文件变更监控备份 |
-| `watchdog_seconds` | `wintv` | `30` | 监控防抖时间（秒），变更静默后才开始备份 |
-| `schedule_enabled` | `sched` | `true` | 启用定时备份 |
-| `schedule_seconds` | `sintv` | `600` | 定时间隔（秒） |
-| `http_server_port` | `port` | `9999` | HTTP API 端口（`0` 停止服务） |
-| `preview_filepath` | `pimg` | `""` | 界面缩略图路径 |
-| `includes_pattern` | `incs` | `""` | 包含通配符，`;` 分隔，如 `*.sav;*.bin` |
-| `excludes_pattern` | `excs` | `""` | 排除通配符，`;` 分隔 |
-| `source_directory` | `sdir` | 程序所在目录 | 游戏存档目录 |
-| `backup_directory` | `bdir` | `sdir` 同级 `snapshots/` | 备份目录（不允许位于 sdir 内部） |
-| `backup_max_count` | `bcnt` | `50` | 最多保留快照数，超出自动清理最旧 |
-| `sound_of_success` | `succ` | `SystemDefault` | 备份成功提示音（音频文件路径或Windows 系统音） |
-| `sound_of_failure` | `fail` | `SystemHand` | 备份失败提示音 |
-| `hotkey_of_create` | `knew` | `ctrl+alt+n` | 创建快照全局热键 |
-| `hotkey_of_toggle` | `ktog` | `ctrl+alt+t` | 启停任务全局热键 |
-| `hotkey_of_delete` | `kdel` | `ctrl+alt+d` | 删除最新快照热键 |
-| `syncwith_process` | `proc` | `""` | 跟随的游戏进程名，如 `ProjectZomboid64` |
-| `compress_storage` | `comp` | `true` | 大文件使用 zstd 压缩存储 |
-| `current_language` | `lang` | `en` | 界面语言（`en` / `zh`，可放 `lang-xx.json` 扩展） |
+| `watchdog_enabled` | `watch` | 启用文件变更监控备份 | `false` |
+| `watchdog_seconds` | `wintv` | 监控防抖时间（秒），变更静默后才开始备份 | `30` |
+| `schedule_enabled` | `sched` | 启用定时备份 | `true` |
+| `schedule_seconds` | `sintv` | 定时间隔（秒） | `600` |
+| `http_server_port` | `port` | HTTP API 端口（`0` 停止服务） | `9999` |
+| `preview_filepath` | `pimg` | 游戏存档内缩略图路径（没有可留空） | `""` |
+| `includes_pattern` | `incs` | 包含通配符，`;` 分隔，如 `*.sav;*.bin` | `""` |
+| `excludes_pattern` | `excs` | 排除通配符，`;` 分隔 | `""` |
+| `source_directory` | `sdir` | 游戏存档目录 | 程序所在目录 |
+| `backup_directory` | `bdir` | 备份目录（不允许位于 sdir 内部） | `sdir` 同级 `snapshots/` |
+| `backup_max_count` | `bcnt` | 最多保留快照数，超出自动清理最旧 | `50` |
+| `sound_of_success` | `succ` | 备份成功提示音（音频文件路径或系统音名称） | `SystemDefault` |
+| `sound_of_failure` | `fail` | 备份失败提示音 | `SystemHand` |
+| `hotkey_of_create` | `knew` | 创建快照全局热键 | `ctrl+alt+n` |
+| `hotkey_of_toggle` | `ktog` | 启停任务全局热键 | `ctrl+alt+t` |
+| `hotkey_of_delete` | `kdel` | 删除最新快照热键 | `ctrl+alt+d` |
+| `syncwith_process` | `proc` | 跟随的游戏进程名，如 `ProjectZomboid64` | `""` |
+| `compress_storage` | `comp` | 大文件使用 zstd 压缩存储 | `true` |
+| `current_language` | `lang` | 界面语言（`en` / `zh`，可放 `lang-xx.json` 扩展） | `en` |
 
 ---
 
@@ -225,6 +225,46 @@ fetch('http://localhost:9999/apis', {
 
 ---
 
+## 性能表现
+
+### 测试环境
+
+| 项目 | 配置 |
+| --- | --- |
+| CPU | AMD 8845 |
+| 操作系统 | Windows 11 (10.0.26200) |
+| 内存 | DDR5 32 GB SDRAM |
+| 存储 | PCIe x4 1 TB SSD |
+
+### 测试方法
+
+- **数据**：100,000 个小文件，随机分散在 2,000 个目录中，总大小 750 MB。
+- **操作**：从指定源路径**同盘复制**到目标路径，耗时取 5 次平均值
+- **工具**：
+  1. Windows 资源管理器自带复制粘贴
+  2. `robocopy /NS /NC /NFL /NDL /E /XO /MT:16`
+  3. GameSnap create --param compress_storage=true or false
+
+### 全量备份
+
+| 工具 | 耗时 | 输出大小 | 备注 |
+| --- | --- | --- | --- |
+| Windows 资源管理器 | 240 s | 750 MB | 系统自带复制粘贴 |
+| robocopy | 31 s | 750 MB | 系统自带命令行工具 |
+| GameSnap comp=false | 56 s | 750 MB | |
+| GameSnap comp=true | 70 s | 140 MB | 逐文件独立压缩 |
+
+
+### 增量备份（部分文件小改动后再次复制）
+
+| 工具 | 耗时 | 累计大小 | 备注 |
+| --- | --- | --- | --- |
+| Windows 资源管理器 | 235 s | 1500 MB | 重拷体积翻倍 |
+| robocopy `/XO /MT:16` | 3 s | 762 MB | 原始文件被覆盖 |
+| GameSnap | 13 s | 145 MB | 压缩与否耗时接近，保留变更前快照 |
+
+---
+
 ## 开发者指南
 
 ### 项目架构
@@ -252,14 +292,18 @@ fetch('http://localhost:9999/apis', {
 # 依赖组 dev（调试）/ extra（可选）/ build（打包）
 uv sync --all-groups
 
-# 通过 poe 运行任务（pyproject.toml 中定义）
-uv run poe run         # 入口 GSnap:main
-uv run poe textual     # textual-dev 热重载调试 TUI
-uv run poe console     # textual 日志控制台
-uv run poe trace       # viztracer 性能追踪 → build/trace.json.gz
-uv run poe view-trace  # 可视化追踪结果
-uv run poe build       # nuitka 打包 onefile
-uv run poe view-build  # 渲染并查看 nuitka 编译 report.html
+# 安装 poe（可选）
+uv tool install poethepoet # 安装到 uv tool dir
+uvx --from poethepoet poe  # 或者从 uv cache dir 临时运行
+
+# 通过 poe 运行定义在 pyproject.toml 中的任务
+poe run         # 入口 GSnap:main
+poe textual     # textual-dev 热重载调试 TUI
+poe console     # textual 日志控制台
+poe trace       # viztracer 性能追踪 → build/trace.json.gz
+poe view-trace  # 可视化追踪结果
+poe build       # nuitka 打包 onefile
+poe view-build  # 渲染并查看 nuitka 编译 report.html
 ```
 
 ### 打包（Nuitka）
@@ -268,17 +312,17 @@ uv run poe view-build  # 渲染并查看 nuitka 编译 report.html
 
 ```bash
 # Windows: choco install upx
-# Linux: apt install gcc upx ccache patchelf python3-tk (or up-ucl)
+# Linux: apt install gcc upx ccache patchelf python3-tk (or upx-ucl)
 
 nuitka GSnap.py                           # 默认生成 onefile 或 app (macOS)
 
 # Windows 切换子系统
-set SUBSYSTEM=CUI && nuitka GSnap.py      # → GameSnap.exe
-$env:SUBSYSTEM = "GUI"; & nuitka GSnap.py # → GameSnapGUI.exe（无控制台）
+set SUBSYSTEM=CUI && nuitka GSnap.py      # cmd 环境变量写法 → GameSnap.exe
+$env:SUBSYSTEM = "GUI"; & nuitka GSnap.py # pwsh环境变量写法 → GameSnapGUI.exe
 
-# 或使用 poe（自动处理环境变量与依赖组）
-uv run poe build
-uv run poe build-gui
+# 或使用 poe 自动处理环境变量与依赖组
+poe build
+poe build-gui
 ```
 
 ### 兼容性说明

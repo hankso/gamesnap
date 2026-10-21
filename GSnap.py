@@ -24,6 +24,7 @@
 #   For CUI on pwsh:    $env:SUBSYSTEM = "CUI"; & nuitka GSnap.py
 #   Use uv dep-group:   uv run --no-group dev --group build nuitka GSnap.py
 #   Changed in v0.1.3:  use `poe` to run commands defined in pyproject.toml
+#   Output file and folder name must match pyproject.toml:project.name
 #
 # nuitka-project: --mode=onefile
 # nuitka-project: --remove-output
@@ -53,6 +54,7 @@
 #    nuitka-project: --windows-icon-from-ico=icon.png
 #    nuitka-project: --output-filename=GameSnapGUI
 #    nuitka-project: --output-folder-name=GameSnapGUI
+#    nuitka-project: --report=build/report-gui.xml
 
 # built-in
 import os
@@ -857,7 +859,7 @@ class SnapRecord(IOMixin):
     {
         "folder": {
             "subfolder": {
-                "file": ["hashval", rsize, mtime],
+                "file": ["hashval", rsize, mtime],  # TODO: storage msgpack.packb(int(hashval, 16))
                 ...
             },
             ...
@@ -971,6 +973,7 @@ class SnapEngine:
                 else:
                     tmp = snap.hdir / str(stat.st_ino)
                 hobj = hashlib.md5()
+                # TODO: for small files: compress in memory with out tmp
                 with open(src, 'rb') as fin, zstd.open(tmp, 'wb') as fout:
                     while buf := fin.read(shutil.COPY_BUFSIZE):
                         hobj.update(buf)
@@ -3364,7 +3367,7 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
             logger.info(f'Copied {src} => {path}')
         if '{name}' not in args.match:
             args.match = ('{name}-' + args.match).replace('--', '-')
-        info = dump({'tag_name': VERSION, 'assets': [{
+        info = dump({'tag_name': f'v{VERSION}', 'assets': [{
             'name': asset_name(args.match),
             'size': path.stat().st_size,
             'digest': 'md5:' + hashlib.md5(path.read_bytes()).hexdigest(),
@@ -3407,23 +3410,31 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
             *(asset['name'] for asset in assets)
         ]))
     logger.info(f'Found {asset["name"]} {size_format(asset["size"])} {asset["updated_at"]}')
+    url = urllib.parse.urljoin(args.url or '', asset['browser_download_url'])
     target = BASEDIR / Path(asset['name']).name
     digest, _, hval = str(asset['digest']).lower().partition(':')
-    hasher = hashlib.new(digest) if digest in hashlib.algorithms_available else None
-    try:
-        with urllib.request.urlopen(
-            urllib.parse.urljoin(args.url, asset['browser_download_url'])
-            if args.url else asset['browser_download_url'], timeout=10
-        ) as rep, open(target, 'wb') as f:
-            while buf := rep.read(shutil.COPY_BUFSIZE):
-                hasher and hasher.update(buf)
-                f.write(buf)
-        if hasher and hasher.hexdigest() != hval:
-            target.unlink()
-            return logger.error(f'Download failed: {digest} does not match')
-    except Exception:
-        target.unlink(missing_ok=True)
-        return logger.exception('Failed to download executable')
+    for i in range(2):
+        try:
+            hasher = hashlib.new(digest) if digest in hashlib.algorithms_available else None
+            with urllib.request.urlopen(url, timeout=10) as rep, open(target, 'wb') as f:
+                total = int(rep.headers.get('Content-Length', asset['size']))
+                while buf := rep.read(shutil.COPY_BUFSIZE):
+                    f.write(buf)
+                    hasher and hasher.update(buf)
+                    logger.debug(f'Downloading {100 * f.tell() / total:6.2f}%')
+            if hasher and hasher.hexdigest() != hval:
+                target.unlink()
+                return logger.error(f'Download failed: {digest} does not match')
+            logger.info(f'Downloaded {target}')
+            break
+        except (KeyboardInterrupt, Exception) as e:
+            target.unlink(missing_ok=True)
+            if isinstance(e, TimeoutError) and url.startswith('https://github.com/'):
+                url = f'https://gh-proxy.com/{url}'
+                continue
+            if not isinstance(e, KeyboardInterrupt):
+                logger.exception('Failed to download executable')
+            return
     try:
         if not WINDOWS:
             target.chmod(current.stat().st_mode if ONEFILE else 0o755)
@@ -3469,7 +3480,7 @@ def run_update(args: argparse.Namespace, _: SnapBroker) -> None:
 
 def run_pack(*a) -> None:
     '''find and rename and test artifacts'''
-    base = BASEDIR / 'build' / 'GameSnap'
+    base = BASEDIR / 'build' / PROJECT
     dst = (BASEDIR / 'dist').mkdirp() / asset_name()
     dzip = dst.with_suffix('.zip') if WINDOWS else Path(f'{dst}.zip')
     for src in base.parent.iterdir():
@@ -3479,9 +3490,9 @@ def run_pack(*a) -> None:
         shutil.copy2(exe, dst)
         with PZipFile(dzip, 'w', zipfile.ZIP_DEFLATED) as zf:
             zf.write(exe, exe.name)
-            if (gui := base.with_name('GameSnapGUI.exe')).is_file():
+            if (gui := base.with_name(f'{PROJECT}GUI.exe')).is_file():
                 zf.write(gui, gui.name)
-                shutil.copy2(gui, dst.with_name(dst.name.replace('GameSnap', 'GameSnapGUI')))
+                shutil.copy2(gui, dst.with_name(dst.name.replace(PROJECT, f'{PROJECT}GUI')))
     if (app := base.with_suffix('.app')).is_dir():      # macOS app bundle
         macho = app / f'Contents/MacOS/{app.stem}'
         lprint(line_buffer(macho, 'test', force=False))
@@ -3614,13 +3625,14 @@ def run_delete(args: argparse.Namespace, brok: SnapBroker) -> str:
 
 def run_summary(args: argparse.Namespace, brok: SnapBroker) -> str:
     snaps = brok.summary(detail=bool(args.size))
+    fwid = len(str(max((snap.fcnt for snap in snaps), default=0)))
     for snap in snaps:
         if args.size:
             rsize, dsize = sum(v[1] for v in snap.flat.values()), snap.size
             size = f'{size_format(dsize):>9s} <= {size_format(rsize):>9s} ({dsize / rsize:.2%})'
         else:
             size = ''
-        rprint(strftime(snap.time), f'{snap.type:6s}', snap.fcnt, 'files', size)
+        rprint(f'{strftime(snap.time)} {snap.type:6s} {snap.fcnt:{fwid}} files {size}')
         if snap.name:
             rprint(f' - rename: {snap.name}')
         rprint(f' - source: {snap.sdir}\n - hashes: {snap.hdir}\n - record: {snap.path}\n')
@@ -3824,7 +3836,7 @@ def make_parser() -> ArgumentParser:
                    help='asset template [[i]name, plat, arch, ver, ext[/]] (default %(default)s)')
     s.add_argument('--force', action='store_true', help='force update to legacy versions')
     s.add_argument('--keep', action='store_true', help='do not clean up old versions')
-    g = s.add_mutually_exclusive_group(required=True)
+    g = s.add_mutually_exclusive_group()
     g.add_argument('--url', type=urlparse, help='fetch latest version from URL')
     g.add_argument('--repo', metavar=('USER', 'REPO'), nargs=2, default=REPOURL.split('/')[-2:],
                    help='fetch latest release from github (default: %(default)s)')

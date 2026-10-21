@@ -92,11 +92,10 @@ jobs:
         continue-on-error: true
         shell: bash
         run: |
-          uv tool install git+https://github.com/Bingdom/Nuitka-Compile-Report-Parser
           for name in report report-gui; do
             xml="build/${name}.xml"
             [[ -f "$xml" ]] || continue
-            uv tool run nuitka-reporter "$xml" "build/${name}-${{ matrix.os }}.html"
+            uv run nuitka-reporter "$xml" "build/${name}-${{ matrix.os }}.html"
           done
 
       - name: Upload release artifacts

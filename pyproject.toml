@@ -21,6 +21,7 @@ dependencies = [
 dev = [
     "viztracer",
     "textual-dev",
+    "nuitka-reporter",
 ]
 extra = [
     "json_repair",
@@ -31,6 +32,9 @@ build = [
     "nuitka",
     "ImageIO",
 ]
+
+[tool.uv.sources]
+nuitka-reporter = { git = "https://github.com/Bingdom/Nuitka-Compile-Report-Parser" }
 
 [tool.poe]
 executor = { type = "uv", group = ["dev", "extra"] }
@@ -76,16 +80,17 @@ default = "pass"
 
     [[tool.poe.tasks.build-gui.switch]]
     case = "win32"
-    cmd = "nuitka GSnap.py --report=build/report-gui.xml $POE_EXTRA_ARGS" # ref = "build"
     env = { SUBSYSTEM = "GUI" }
+    cmd = "nuitka GSnap.py $POE_EXTRA_ARGS"
+    executor = { exact = true, no-group = "dev", group = ["extra", "build"] }
 
 [tool.poe.tasks.view-build]
 help = "View build report"
 sequence = [
     "_mkdir",
-    { cmd = "uv tool run nuitka-reporter build/report.xml build/report.html $POE_EXTRA_ARGS" },
+    { cmd = "nuitka-reporter build/report.xml build/report.html $POE_EXTRA_ARGS" },
     { script = "GSnap:browse('build/report.html', True)" }
-]  # currently nuitka-reporter only render html so we have to manually open it
+]  # currently nuitka-reporter only render html and we have to manually open it
 
 [tool.poe.tasks.dist]
 help = "Build and pack and test"
